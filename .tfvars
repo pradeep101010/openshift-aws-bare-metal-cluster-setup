@@ -1,0 +1,29 @@
+# Copy this to terraform.tfvars and fill in your values.
+# Never commit terraform.tfvars to git — it contains secrets.
+
+aws_region        = "us-east-1"
+availability_zone = "us-east-1a"   # Verify m5.metal is available in this AZ
+
+cluster_name      = "ocp-poc"
+base_domain       = "example.com"
+ocp_version       = "4.14.0"
+
+# AWS key pair name (must exist in your account in the chosen region)
+key_pair_name     = "openshift-poc-rhcos-node"
+
+# Your SSH public key (embedded into RHCOS nodes for the 'core' user)
+ssh_public_key    = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCw17vyls0ddKP2mt5LH0ylHIXroaoFbZxZ6tigKWLNBh6cPUtpvfmReoX6A+1KZJiiHpF8cNxGPfTn95FQSPnpzgkKP5CX6leYr/BFYk5Fot4gXUaOObjzoT3U1573rhgrzOPH8VLEIrO+FGlE4/tupwcCkSGS0YGhCzwbtHcBx+oQfILKfRLdpRPseERHA6W4YifZO0aXLgo3Ta98ID4lr5FYz8wr3FLaRtuGXvf9xcN96uRfQnLA002q6aW4NaOlAnkItZStvYPCrdmd6EQwyhQuF//q6cthAcDXRe85DDWJTe3J+5xaORye6Y4YkamdOL1Srs6eV1uEMS3FKEBF"
+
+# OCP pull secret from https://console.redhat.com/openshift/install/pull-secret
+pull_secret = '{"auths":{"cloud.openshift.com":{"auth":"b3BlbnNoaWZ0LXJlbGVhc2UtZGV2K29jbV9hY2Nlc3NfZjA1N2YxNjQ3MzQ1NDA1Yzk4OTA0MDdjNGZkY2Y0NWY6QlUySkhWTTMxT1M2M1VHVVMxVUw5MktYTEg5UEczR1g4TEJJR0FFRFJSVlNDTUNMRDk5VUo1UEdMNUlKN0VXMw==","email":"pradeepsn@presidio.com"},"quay.io":{"auth":"b3BlbnNoaWZ0LXJlbGVhc2UtZGV2K29jbV9hY2Nlc3NfZjA1N2YxNjQ3MzQ1NDA1Yzk4OTA0MDdjNGZkY2Y0NWY6QlUySkhWTTMxT1M2M1VHVVMxVUw5MktYTEg5UEczR1g4TEJJR0FFRFJSVlNDTUNMRDk5VUo1UEdMNUlKN0VXMw==","email":"pradeepsn@presidio.com"},"registry.connect.redhat.com":{"auth":"fHVoYy1wb29sLWJiZjU3MDE3LTc0N2ItNGEwOC1iMmJkLWJhNmY3NTMxNjVmNTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSTNOVFV5TXpobVl6WTFabUUwTkRNeFlqSTJabU5oTXpabE1qSmtabUZpTUNKOS5YMG16YWtZN2daNFZLbzZNSllqY1BSemQ4dDJ1S3dCQVNQS21jZzNVVHU1YXFYMlZtcHh2aWh1aFJta3Z0WVJueHo0MmZld3ZLRUZVbF9LZ3BndlhaejFSTHJWVHlHekJ2MFZTSVBtTmdyNHQ0YlVMUElkLXRrY0FIVS0zTjluTjlfM19MZnhuaE13R2lTWFZKWlpqUXpmbXdVSS0ybFQ0eG5mZXF5MlowaDBFOVZsWktiVTQ1UHZiNlRHNEx2TzNxZml5LWZmaGwtaUZrRkhYSXNCWVU1RkQ2TXFXMlJ4TTN0eERyaE9VaW9xUHZER0xvay1vU0lMY1FJZmdmNjhKRGQyLW9qYTItMk5QTzFVb1p4TS1xdzJBNzctUTY0YzVmUkpoSFoxU25mSGpSRzUzelVLS2I5NzVwWTI4WWVqUEQzeS1tWE12bVM2SGo3UWdHb09pSkg3bWR5QjJpME5BM1dKMnNtMVdPZGhjeWx5eUlvSXVHTEdrOUpaU0tFYmVKUlBwY19qWkRrY3F0ZWMwaTVCM29nUzFtbk1ZZVB1dkp4dmpobXl5cS1QNUUxZ2otSXNNRVZaSDZPREpfdk15U01Wc0tFQzBMbWxSZ1dhMkxtU2tsQjl2RFpvWEtIS3BLVVJyTmEyVXZ4Z3JYbEI3TDh4ZzNNOGZjQVhFLWdOdHVJQWFQOVdaTjc1NjFrTjJ3cEVIcjJYVEd4enp4SGg5bUhoWlNqZEJOeDdYeWtGc3ZLWDVENnY4UVdPN2ZOaWl2dHJpcU9sanhKYkRybHlCYUJpbWZ1SGxGSHFHQkpkQ3ljNV9JVkpJQ25GMnNVR011T3FMbVJiel9zU2dFc3ktZVhYZ1VrM1J5ZEREMXZHWHhucHZfOXJPNVNqU3NST0xuX25kOVd2bzJabw==","email":"pradeepsn@presidio.com"},"registry.redhat.io":{"auth":"fHVoYy1wb29sLWJiZjU3MDE3LTc0N2ItNGEwOC1iMmJkLWJhNmY3NTMxNjVmNTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSTNOVFV5TXpobVl6WTFabUUwTkRNeFlqSTJabU5oTXpabE1qSmtabUZpTUNKOS5YMG16YWtZN2daNFZLbzZNSllqY1BSemQ4dDJ1S3dCQVNQS21jZzNVVHU1YXFYMlZtcHh2aWh1aFJta3Z0WVJueHo0MmZld3ZLRUZVbF9LZ3BndlhaejFSTHJWVHlHekJ2MFZTSVBtTmdyNHQ0YlVMUElkLXRrY0FIVS0zTjluTjlfM19MZnhuaE13R2lTWFZKWlpqUXpmbXdVSS0ybFQ0eG5mZXF5MlowaDBFOVZsWktiVTQ1UHZiNlRHNEx2TzNxZml5LWZmaGwtaUZrRkhYSXNCWVU1RkQ2TXFXMlJ4TTN0eERyaE9VaW9xUHZER0xvay1vU0lMY1FJZmdmNjhKRGQyLW9qYTItMk5QTzFVb1p4TS1xdzJBNzctUTY0YzVmUkpoSFoxU25mSGpSRzUzelVLS2I5NzVwWTI4WWVqUEQzeS1tWE12bVM2SGo3UWdHb09pSkg3bWR5QjJpME5BM1dKMnNtMVdPZGhjeWx5eUlvSXVHTEdrOUpaU0tFYmVKUlBwY19qWkRrY3F0ZWMwaTVCM29nUzFtbk1ZZVB1dkp4dmpobXl5cS1QNUUxZ2otSXNNRVZaSDZPREpfdk15U01Wc0tFQzBMbWxSZ1dhMkxtU2tsQjl2RFpvWEtIS3BLVVJyTmEyVXZ4Z3JYbEI3TDh4ZzNNOGZjQVhFLWdOdHVJQWFQOVdaTjc1NjFrTjJ3cEVIcjJYVEd4enp4SGg5bUhoWlNqZEJOeDdYeWtGc3ZLWDVENnY4UVdPN2ZOaWl2dHJpcU9sanhKYkRybHlCYUJpbWZ1SGxGSHFHQkpkQ3ljNV9JVkpJQ25GMnNVR011T3FMbVJiel9zU2dFc3ktZVhYZ1VrM1J5ZEREMXZHWHhucHZfOXJPNVNqU3NST0xuX25kOVd2bzJabw==","email":"pradeepsn@presidio.com"}}}'
+
+# Instance types
+bastion_instance_type = "t3.medium"   # Needs ~30 GB free for RHCOS image
+node_instance_type    = "m5.metal"    # Must be bare metal
+
+# Disk
+rhcos_disk_size_gb = 130
+
+# Networking
+vpc_cidr    = "10.0.0.0/16"
+subnet_cidr = "10.0.0.0/20"
