@@ -36,25 +36,3 @@ output "ssh_commands" {
     master0   = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.master_ips[0]}"
   }
 }
-
-output "next_steps" {
-  description = "What to do after terraform apply"
-  value       = <<-EOT
-    1. Wait ~10 min for bastion to finish setup:
-       ssh ubuntu@${aws_instance.bastion.public_ip} 'tail -f /var/log/bastion-init.log'
-
-    2. Once bastion shows 'BASTION READY', run the volume-swap script:
-       ./complete-setup.sh ${aws_instance.bastion.public_ip} ${var.aws_region} ${var.cluster_name}
-
-    3. Monitor bootstrap from bastion:
-       ssh ubuntu@${aws_instance.bastion.public_ip}
-       openshift-install wait-for bootstrap-complete --dir=~/ocp-install --log-level=info
-
-    4. After bootstrap completes, approve worker CSRs:
-       export KUBECONFIG=~/ocp-install/auth/kubeconfig
-       oc get csr | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
-
-    5. Monitor install completion:
-       openshift-install wait-for install-complete --dir=~/ocp-install --log-level=info
-  EOT
-}
