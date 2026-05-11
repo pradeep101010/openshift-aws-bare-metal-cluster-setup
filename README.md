@@ -1,7 +1,7 @@
 # OpenShift 4.14 on AWS Bare Metal — Terraform
 
 Deploys a full OpenShift 4.14 UPI cluster on AWS using `m5.metal` bare metal
-instances with **zero manual intervention** after `terraform apply`.
+instances.
 
 Since AWS bare metal instances do not expose EFI PXE boot, this setup uses
 **coreos-installer** running from Ubuntu user-data to write RHCOS to a
