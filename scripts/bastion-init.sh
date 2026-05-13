@@ -39,10 +39,6 @@ NODE_IPS="$BOOTSTRAP_IP $MASTER0_IP $MASTER1_IP $MASTER2_IP $WORKER_IPS"
 WORKER_COUNT=$(echo $WORKER_IPS | wc -w)
 EXPECTED_NODES=$((3 + WORKER_COUNT))
 
-# ── Fix 1: Restore DNS BEFORE installing anything ────────────────────────────
-echo "==> Fixing DNS before package install"
-rm -f /etc/resolv.conf
-echo "nameserver 169.254.169.253" > /etc/resolv.conf
 
 # Fix 2: Add bastion hostname to /etc/hosts to fix sudo warnings
 echo "$BASTION_IP $(hostname)" >> /etc/hosts
@@ -266,11 +262,11 @@ swap_volume() {
     --region "$REGION" --output text)
 
   ROOT_VOL=$(aws ec2 describe-instances --instance-id "$INSTANCE" --region "$REGION" \
-    --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/sda1`].Ebs.VolumeId' \
+    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='/dev/sda1'].Ebs.VolumeId" \
     --output text)
 
   RHCOS_VOL=$(aws ec2 describe-instances --instance-id "$INSTANCE" --region "$REGION" \
-    --query 'Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==`/dev/xvdf`].Ebs.VolumeId' \
+    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='/dev/xvdf'].Ebs.VolumeId" \
     --output text)
 
   echo "  $IP → instance=$INSTANCE root=$ROOT_VOL rhcos=$RHCOS_VOL"

@@ -16,9 +16,10 @@ export MASTER2_IP="${master2_ip}"
 export WORKER_IPS="${worker_ips}"
 export SUBNET_CIDR="${subnet_cidr}"
 
-# Fix DNS before fetching from GitHub
+systemctl disable systemd-resolved
+systemctl stop systemd-resolved
 rm -f /etc/resolv.conf
-echo "nameserver 169.254.169.253" > /etc/resolv.conf
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
 # Wait for DNS to be ready
 for i in {1..10}; do
@@ -28,7 +29,6 @@ for i in {1..10}; do
 done
 
 # Fetch the real script from GitHub and run it
-REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main"
-curl -sf "$REPO_URL/scripts/bastion-init.sh" -o /tmp/bastion-init.sh
+curl -sf "https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main/scripts/bastion-init.sh" -o /tmp/bastion-init.sh
 chmod +x /tmp/bastion-init.sh
 bash /tmp/bastion-init.sh
