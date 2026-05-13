@@ -22,7 +22,7 @@ resource "aws_instance" "bastion" {
     delete_on_termination = true
   }
 
-  user_data = base64encode(templatefile("${path.module}/scripts/bastion-init.sh.tpl", {
+  user_data = base64encode(templatefile("${path.module}/scripts/bastion-init-bootstrap.sh.tpl", {
     cluster_name            = var.cluster_name
     base_domain             = var.base_domain
     ocp_version             = var.ocp_version
@@ -35,10 +35,7 @@ resource "aws_instance" "bastion" {
     master2_ip              = local.master_ips[2]
     worker_ips              = join(" ", local.worker_ips)
     subnet_cidr             = var.subnet_cidr
-  })
-  
-  )
-
+  }))
   tags = merge(local.common_tags, { Name = "${var.cluster_name}-bastion" })
 }
 

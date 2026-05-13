@@ -13,22 +13,17 @@
 #   9. After bootstrap, run wait-for-install-complete automatically
 # =============================================================================
 set -euo pipefail
-exec > /var/log/bastion-init.log 2>&1
+exec >> /var/log/bastion-init.log 2>&1
 
 echo "============================================"
-echo " OCP Bastion Init — $(date)"
+echo " OCP Bastion Init (from GitHub) — $(date)"
 echo "============================================"
 
-CLUSTER_NAME="${cluster_name}"
-BASE_DOMAIN="${base_domain}"
-OCP_VERSION="${ocp_version}"
-BASTION_IP="${bastion_ip}"
-BOOTSTRAP_IP="${bootstrap_ip}"
-MASTER0_IP="${master0_ip}"
-MASTER1_IP="${master1_ip}"
-MASTER2_IP="${master2_ip}"
-WORKER_IPS="${worker_ips}"
-SUBNET_CIDR="${subnet_cidr}"
+# Variables come from bootstrap script env vars:
+# CLUSTER_NAME, BASE_DOMAIN, OCP_VERSION, BASTION_IP, BOOTSTRAP_IP,
+# MASTER0_IP, MASTER1_IP, MASTER2_IP, WORKER_IPS, SUBNET_CIDR,
+# PULL_SECRET, SSH_PUBLIC_KEY
+
 BASE_WORKER_IP="10.0.1"
 BASE_WORKER_OFFSET=24
 REGION=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
@@ -41,7 +36,6 @@ WEB_ROOT="/var/www/html"
 INSTALL_DIR="/home/ubuntu/ocp-install"
 NODE_IPS="$BOOTSTRAP_IP $MASTER0_IP $MASTER1_IP $MASTER2_IP $WORKER_IPS"
 
-# derive counts from dynamic worker list
 WORKER_COUNT=$(echo $WORKER_IPS | wc -w)
 EXPECTED_NODES=$((3 + WORKER_COUNT))
 
@@ -187,8 +181,8 @@ networking:
 platform:
   none: {}
 fips: false
-pullSecret: '${pull_secret}'
-sshKey: '${ssh_public_key}'
+pullSecret: '$PULL_SECRET'
+sshKey: '$SSH_PUBLIC_KEY'
 INSTALLEOF
 
 chown ubuntu:ubuntu $INSTALL_DIR/install-config.yaml
@@ -387,14 +381,14 @@ REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-met
 echo "==> Applying autoscaler manifests"
 
 curl -sf "$REPO_URL/autoscaler/manifests/machineset.yaml" \
-  | sed "s/\${cluster_name}/$CLUSTER_NAME/g; s/\${worker_count}/$WORKER_COUNT/g" \
+  | sed "s/__CLUSTER_NAME__/$CLUSTER_NAME/g; s/__WORKER_COUNT__/$WORKER_COUNT/g" \
   | oc apply -f -
 
 curl -sf "$REPO_URL/autoscaler/manifests/cluster-autoscaler.yaml" \
   | oc apply -f -
 
 curl -sf "$REPO_URL/autoscaler/manifests/machine-autoscaler.yaml" \
-  | sed "s/\${worker_count}/$WORKER_COUNT/g" \
+  | sed "s/__WORKER_COUNT__/$WORKER_COUNT/g" \
   | oc apply -f -
 
 echo "==> Autoscaler manifests applied"
