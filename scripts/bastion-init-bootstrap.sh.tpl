@@ -29,6 +29,6 @@ done
 
 # Fetch the real script from GitHub and run it
 REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main"
-curl -sf "$REPO_URL/scripts/bastion-init.sh.tpl" -o /tmp/bastion-init.sh.tpl
-chmod +x /tmp/bastion-init.sh.tpl
-bash /tmp/bastion-init.sh.tpl
+curl -sf "$REPO_URL/scripts/bastion-init.sh" -o /tmp/bastion-init.sh
+chmod +x /tmp/bastion-init.sh
+bash /tmp/bastion-init.sh
