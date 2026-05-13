@@ -101,8 +101,11 @@ DNS_CHECK=$(dig +short @127.0.0.1 api.$CLUSTER_DOMAIN 2>/dev/null || echo "FAILE
 echo "==> DNS check: api.$CLUSTER_DOMAIN → $DNS_CHECK"
 
 # ── 3. Apache file server ─────────────────────────────────────────────────────
-echo "==> Configuring Apache"
+echo "==> Configuring Apache with CGI status endpoint"
 mkdir -p $WEB_ROOT/rhcos $WEB_ROOT/ignition $WEB_ROOT/status
+
+# Enable CGI module
+a2enmod cgi
 
 cat > /etc/apache2/conf-available/ocp.conf << 'APACHEEOF'
 <Directory /var/www/html>
@@ -110,7 +113,25 @@ cat > /etc/apache2/conf-available/ocp.conf << 'APACHEEOF'
     AllowOverride None
     Require all granted
 </Directory>
+ScriptAlias /status-update/ /usr/lib/cgi-bin/
+<Directory /usr/lib/cgi-bin>
+    Options +ExecCGI
+    Require all granted
+</Directory>
 APACHEEOF
+
+# CGI script so nodes can notify bastion via simple GET
+cat > /usr/lib/cgi-bin/status-update << 'CGIEOF'
+#!/bin/bash
+NODE=$(echo "$PATH_INFO" | tr -d '/' | tr -cd '[:alnum:]-_')
+if [ -n "$NODE" ]; then
+  echo "done" > /var/www/html/status/$NODE
+  printf "Content-Type: text/plain\r\n\r\nok\n"
+else
+  printf "Content-Type: text/plain\r\n\r\nerror: no node name\n"
+fi
+CGIEOF
+chmod +x /usr/lib/cgi-bin/status-update
 
 a2enconf ocp
 systemctl enable apache2
@@ -271,7 +292,17 @@ swap_volume() {
   echo "  $IP → instance=$INSTANCE root=$ROOT_VOL rhcos=$RHCOS_VOL"
 
   aws ec2 stop-instances --instance-ids "$INSTANCE" --region "$REGION"
-  aws ec2 wait instance-stopped --instance-ids "$INSTANCE" --region "$REGION"
+
+  # Manual poll — wait up to 30 min for m5.metal to stop
+  echo "  Waiting for $INSTANCE to stop..."
+  for i in $(seq 1 120); do
+    STATE=$(aws ec2 describe-instances \
+      --instance-id "$INSTANCE" --region "$REGION" \
+      --query 'Reservations[0].Instances[0].State.Name' --output text)
+    echo "  attempt $i: $STATE"
+    [ "$STATE" = "stopped" ] && break
+    sleep 15
+  done
 
   aws ec2 detach-volume --volume-id "$ROOT_VOL" --region "$REGION" || true
   aws ec2 detach-volume --volume-id "$RHCOS_VOL" --region "$REGION" || true
@@ -288,10 +319,18 @@ swap_volume() {
   echo "==> Volume swap complete for $IP"
 }
 
-# ── 13. Volume swap for all nodes ────────────────────────────────────────────
-echo "==> Starting volume swap for all nodes"
+# ── 13. Volume swap for all nodes in parallel ─────────────────────────────────
+echo "==> Starting volume swap for all nodes in parallel"
+PIDS=()
 for IP in $NODE_IPS; do
-  swap_volume $IP
+  swap_volume $IP &
+  PIDS+=($!)
+  echo "  Swap launched for $IP (PID $!)"
+done
+
+# Wait for all swaps to complete
+for PID in "${PIDS[@]}"; do
+  wait $PID && echo "  PID $PID completed" || echo "  PID $PID failed"
 done
 echo "==> All nodes booting into RHCOS"
 
