@@ -16,19 +16,28 @@ export MASTER2_IP="${master2_ip}"
 export WORKER_IPS="${worker_ips}"
 export SUBNET_CIDR="${subnet_cidr}"
 
+# Fix hostname
+echo "127.0.0.1 $(hostname)" >> /etc/hosts
+
+# Fix DNS
 systemctl disable systemd-resolved
 systemctl stop systemd-resolved
 rm -f /etc/resolv.conf
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
-# Wait for DNS to be ready
+# Wait for DNS
 for i in {1..10}; do
   nslookup raw.githubusercontent.com &>/dev/null && break
   echo "Waiting for DNS... attempt $i"
   sleep 5
 done
 
-# Fetch the real script from GitHub and run it
-curl -sf "https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main/scripts/bastion-init.sh" -o /tmp/bastion-init.sh
+# Get latest commit SHA to bypass CDN cache
+SHA=$(curl -sf "https://api.github.com/repos/pradeep101010/openshift-aws-bare-metal-cluster-setup/commits/main" | grep '"sha"' | head -1 | cut -d'"' -f4)
+echo "Fetching commit: $SHA"
+
+# Fetch and run bastion-init.sh
+curl -sf "https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/$SHA/scripts/bastion-init.sh" \
+  -o /tmp/bastion-init.sh
 chmod +x /tmp/bastion-init.sh
 bash /tmp/bastion-init.sh
