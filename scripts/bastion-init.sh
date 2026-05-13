@@ -262,11 +262,11 @@ swap_volume() {
     --region "$REGION" --output text)
 
   ROOT_VOL=$(aws ec2 describe-instances --instance-id "$INSTANCE" --region "$REGION" \
-    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='/dev/sda1'].Ebs.VolumeId" \
+    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==\`/dev/sda1\`].Ebs.VolumeId" \
     --output text)
 
   RHCOS_VOL=$(aws ec2 describe-instances --instance-id "$INSTANCE" --region "$REGION" \
-    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='/dev/xvdf'].Ebs.VolumeId" \
+    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName==\`/dev/xvdf\`].Ebs.VolumeId" \
     --output text)
 
   echo "  $IP → instance=$INSTANCE root=$ROOT_VOL rhcos=$RHCOS_VOL"
