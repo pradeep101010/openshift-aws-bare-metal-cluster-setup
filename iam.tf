@@ -1,7 +1,3 @@
-# IAM role attached to every OCP node.
-# Grants EC2 + SSM permissions so the node user-data script can
-# stop itself, swap the root volume, and restart — all via AWS API.
-
 resource "aws_iam_role" "ocp_node" {
   name = "${var.cluster_name}-node-role"
 
@@ -25,11 +21,12 @@ resource "aws_iam_role_policy" "ocp_node_ec2" {
     Version = "2012-10-17"
     Statement = [
       {
-        # Volume swap: stop self, detach/attach volumes, start self
+        # Volume swap
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
           "ec2:DescribeVolumes",
+          "ec2:DescribeInstanceStatus",
           "ec2:StopInstances",
           "ec2:StartInstances",
           "ec2:AttachVolume",
@@ -39,9 +36,37 @@ resource "aws_iam_role_policy" "ocp_node_ec2" {
         Resource = "*"
       },
       {
-        # SSM for remote debugging if needed
+        # EBS CSI driver
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateVolume",
+          "ec2:DeleteVolume",
+          "ec2:CreateSnapshot",
+          "ec2:DeleteSnapshot",
+          "ec2:DescribeSnapshots",
+          "ec2:DescribeAvailabilityZones",
+          "ec2:CreateTags",
+        ]
+        Resource = "*"
+      },
+      {
+        # SSM for remote debugging
         Effect   = "Allow"
         Action   = ["ssm:*", "ssmmessages:*", "ec2messages:*"]
+        Resource = "*"
+      },
+      {
+        # Autoscaler VM — provision and terminate worker nodes
+        Effect = "Allow"
+        Action = [
+          "ec2:RunInstances",
+          "ec2:TerminateInstances",
+          "ec2:DescribeImages",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeTags",
+          "iam:PassRole",
+        ]
         Resource = "*"
       }
     ]

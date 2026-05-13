@@ -1,3 +1,4 @@
+```bash
 #!/bin/bash
 # =============================================================================
 #
@@ -26,9 +27,10 @@ BOOTSTRAP_IP="${bootstrap_ip}"
 MASTER0_IP="${master0_ip}"
 MASTER1_IP="${master1_ip}"
 MASTER2_IP="${master2_ip}"
-WORKER0_IP="${worker0_ip}"
-WORKER1_IP="${worker1_ip}"
+WORKER_IPS="${worker_ips}"
 SUBNET_CIDR="${subnet_cidr}"
+BASE_WORKER_IP="10.0.1"
+BASE_WORKER_OFFSET=24
 REGION=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
   -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" | \
   xargs -I{} curl -s -H "X-aws-ec2-metadata-token: {}" \
@@ -37,6 +39,11 @@ REGION=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
 CLUSTER_DOMAIN="$CLUSTER_NAME.$BASE_DOMAIN"
 WEB_ROOT="/var/www/html"
 INSTALL_DIR="/home/ubuntu/ocp-install"
+NODE_IPS="$BOOTSTRAP_IP $MASTER0_IP $MASTER1_IP $MASTER2_IP $WORKER_IPS"
+
+# derive counts from dynamic worker list
+WORKER_COUNT=$(echo $WORKER_IPS | wc -w)
+EXPECTED_NODES=$((3 + WORKER_COUNT))
 
 # ── Fix 1: Restore DNS BEFORE installing anything ────────────────────────────
 echo "==> Fixing DNS before package install"
@@ -68,6 +75,9 @@ nameserver 127.0.0.1
 nameserver 169.254.169.253
 EOF
 
+# first worker IP as ingress entry point
+FIRST_WORKER_IP=$(echo $WORKER_IPS | awk '{print $1}')
+
 cat > /etc/dnsmasq.conf << EOF
 port=53
 bind-interfaces
@@ -78,8 +88,8 @@ server=169.254.169.253
 address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP
 address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP
 
-# Wildcard ingress → worker0
-address=/.apps.$CLUSTER_DOMAIN/$WORKER0_IP
+# Wildcard ingress → first worker
+address=/.apps.$CLUSTER_DOMAIN/$FIRST_WORKER_IP
 
 # etcd
 address=/etcd-0.$CLUSTER_DOMAIN/$MASTER0_IP
@@ -206,8 +216,14 @@ $MASTER2_IP etcd-2.$CLUSTER_DOMAIN
 EOF
 
 # ── 9. Node status tracking ───────────────────────────────────────────────────
-for node in bootstrap master0 master1 master2 worker0 worker1; do
+for node in bootstrap master0 master1 master2; do
   echo "pending" > $WEB_ROOT/status/$node
+done
+
+WORKER_INDEX=0
+for IP in $WORKER_IPS; do
+  echo "pending" > $WEB_ROOT/status/worker$WORKER_INDEX
+  WORKER_INDEX=$((WORKER_INDEX + 1))
 done
 chown -R www-data:www-data $WEB_ROOT/status
 
@@ -224,7 +240,15 @@ echo "==> BASTION READY — nodes can now start"
 
 # ── 12. Wait for all nodes to complete coreos-installer ──────────────────────
 echo "==> Waiting for all nodes to complete coreos-installer..."
-NODES="bootstrap master0 master1 master2 worker0 worker1"
+
+# build dynamic node list
+NODES="bootstrap master0 master1 master2"
+WORKER_INDEX=0
+for IP in $WORKER_IPS; do
+  NODES="$NODES worker$WORKER_INDEX"
+  WORKER_INDEX=$((WORKER_INDEX + 1))
+done
+
 while true; do
   ALL_DONE=true
   for NODE in $NODES; do
@@ -237,14 +261,11 @@ while true; do
 done
 echo "==> All nodes completed coreos-installer"
 
-# ── 13. Volume swap for all nodes from bastion ───────────────────────────────
-echo "==> Starting volume swap for all nodes"
+# ── Volume swap function ──────────────────────────────────────────────────────
+swap_volume() {
+  local IP=$1
+  echo "==> Volume swap for $IP"
 
-NODE_IPS="$BOOTSTRAP_IP $MASTER0_IP $MASTER1_IP $MASTER2_IP $WORKER0_IP $WORKER1_IP"
-
-# Collect instance IDs and volumes
-declare -a INSTANCES ROOT_VOLS RHCOS_VOLS
-for IP in $NODE_IPS; do
   INSTANCE=$(aws ec2 describe-instances \
     --filters "Name=private-ip-address,Values=$IP" "Name=instance-state-name,Values=running" \
     --query 'Reservations[0].Instances[0].InstanceId' \
@@ -259,39 +280,31 @@ for IP in $NODE_IPS; do
     --output text)
 
   echo "  $IP → instance=$INSTANCE root=$ROOT_VOL rhcos=$RHCOS_VOL"
-  INSTANCES+=("$INSTANCE")
-  ROOT_VOLS+=("$ROOT_VOL")
-  RHCOS_VOLS+=("$RHCOS_VOL")
-done
 
-# Stop all
-echo "==> Stopping all nodes..."
-aws ec2 stop-instances --instance-ids "${INSTANCES[@]}" --region "$REGION"
-aws ec2 wait instance-stopped --instance-ids "${INSTANCES[@]}" --region "$REGION"
-echo "==> All stopped"
+  aws ec2 stop-instances --instance-ids "$INSTANCE" --region "$REGION"
+  aws ec2 wait instance-stopped --instance-ids "$INSTANCE" --region "$REGION"
 
-# Detach all
-echo "==> Detaching volumes..."
-for VOL in "${ROOT_VOLS[@]}" "${RHCOS_VOLS[@]}"; do
-  aws ec2 detach-volume --volume-id "$VOL" --region "$REGION" || true
-done
-sleep 40
+  aws ec2 detach-volume --volume-id "$ROOT_VOL" --region "$REGION" || true
+  aws ec2 detach-volume --volume-id "$RHCOS_VOL" --region "$REGION" || true
+  sleep 40
 
-# Attach RHCOS as root
-echo "==> Attaching RHCOS volumes as root..."
-for i in "${!INSTANCES[@]}"; do
   aws ec2 attach-volume \
-    --volume-id "${RHCOS_VOLS[$i]}" \
-    --instance-id "${INSTANCES[$i]}" \
+    --volume-id "$RHCOS_VOL" \
+    --instance-id "$INSTANCE" \
     --device /dev/sda1 \
     --region "$REGION"
-done
-sleep 15
+  sleep 15
 
-# Start all
-echo "==> Starting all nodes into RHCOS..."
-aws ec2 start-instances --instance-ids "${INSTANCES[@]}" --region "$REGION"
-echo "==> Volume swap complete — nodes booting into RHCOS"
+  aws ec2 start-instances --instance-ids "$INSTANCE" --region "$REGION"
+  echo "==> Volume swap complete for $IP"
+}
+
+# ── 13. Volume swap for all nodes ────────────────────────────────────────────
+echo "==> Starting volume swap for all nodes"
+for IP in $NODE_IPS; do
+  swap_volume $IP
+done
+echo "==> All nodes booting into RHCOS"
 
 # ── 14. Wait for nodes to boot RHCOS ─────────────────────────────────────────
 echo "==> Waiting for all nodes to boot RHCOS..."
@@ -307,14 +320,13 @@ for IP in $NODE_IPS; do
   echo "  $IP is running RHCOS"
 done
 
-# ── 15. Fix 7: Update DNS from bootstrap to master0 after bootstrap ───────────
+# ── 15. Update DNS from bootstrap to master0 after bootstrap ─────────────────
 echo "==> Waiting for bootstrap-complete..."
 chown -R ubuntu:ubuntu $INSTALL_DIR
 
 sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
 
-# Fix 7: update DNS to point api.* to master0 now that bootstrap is done
 echo "==> Updating DNS: api.* → master0 ($MASTER0_IP)"
 sed -i "s|address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
 sed -i "s|address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api-int.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
@@ -322,7 +334,7 @@ sed -i "s|$BOOTSTRAP_IP api.$CLUSTER_DOMAIN|$MASTER0_IP api.$CLUSTER_DOMAIN|" /e
 systemctl restart dnsmasq
 echo "==> DNS updated: api.$CLUSTER_DOMAIN → $(dig +short @127.0.0.1 api.$CLUSTER_DOMAIN)"
 
-# ── 16. Approve worker CSRs (two rounds) ─────────────────────────────────────
+# ── 16. Approve worker CSRs ───────────────────────────────────────────────────
 echo "==> Approving worker CSRs..."
 for round in 1 2; do
   echo "  Round $round..."
@@ -336,15 +348,15 @@ for round in 1 2; do
   fi
 done
 
-# Keep approving until all workers are Ready
-echo "==> Waiting for all nodes to be Ready..."
-until [ "$(oc get nodes --no-headers 2>/dev/null | grep -c Ready)" = "5" ]; do
+# keep approving until all nodes ready
+echo "==> Waiting for all $EXPECTED_NODES nodes to be Ready..."
+until [ "$(oc get nodes --no-headers 2>/dev/null | grep -c Ready)" = "$EXPECTED_NODES" ]; do
   PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
   [ -n "$PENDING" ] && echo "$PENDING" | xargs oc adm certificate approve
   sleep 15
 done
 
-echo "==> All 5 nodes Ready!"
+echo "==> All $EXPECTED_NODES nodes Ready!"
 oc get nodes
 
 # ── 17. Wait for install complete ────────────────────────────────────────────
@@ -359,3 +371,75 @@ echo " Console: https://console-openshift-console.apps.$CLUSTER_DOMAIN"
 echo " API:     https://api.$CLUSTER_DOMAIN:6443"
 echo " kubeadmin password: $(cat $INSTALL_DIR/auth/kubeadmin-password)"
 echo "============================================"
+
+# ── 17b. Terminate bootstrap node ────────────────────────────────────────────
+echo "==> Terminating bootstrap node"
+BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
+  --filters "Name=private-ip-address,Values=$BOOTSTRAP_IP" \
+  --query 'Reservations[0].Instances[0].InstanceId' \
+  --region "$REGION" --output text)
+aws ec2 terminate-instances --instance-ids "$BOOTSTRAP_INSTANCE" --region "$REGION"
+echo "==> Bootstrap terminated: $BOOTSTRAP_INSTANCE"
+
+REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main"
+
+# ── 18. Apply autoscaler manifests ───────────────────────────────────────────
+echo "==> Applying autoscaler manifests"
+
+curl -sf "$REPO_URL/autoscaler/manifests/machineset.yaml" \
+  | sed "s/\${cluster_name}/$CLUSTER_NAME/g; s/\${worker_count}/$WORKER_COUNT/g" \
+  | oc apply -f -
+
+curl -sf "$REPO_URL/autoscaler/manifests/cluster-autoscaler.yaml" \
+  | oc apply -f -
+
+curl -sf "$REPO_URL/autoscaler/manifests/machine-autoscaler.yaml" \
+  | sed "s/\${worker_count}/$WORKER_COUNT/g" \
+  | oc apply -f -
+
+echo "==> Autoscaler manifests applied"
+oc get clusterautoscaler
+oc get machineset -n openshift-machine-api
+oc get machineautoscaler -n openshift-machine-api
+
+# ── 19. Publish autoscaler scripts ───────────────────────────────────────────
+echo "==> Publishing autoscaler scripts"
+mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth $WEB_ROOT/scripts
+
+curl -sf "$REPO_URL/autoscaler/webhook.py"             -o $WEB_ROOT/autoscaler/webhook.py
+curl -sf "$REPO_URL/autoscaler/watcher.py"             -o $WEB_ROOT/autoscaler/watcher.py
+curl -sf "$REPO_URL/autoscaler/requirements.txt"       -o $WEB_ROOT/autoscaler/requirements.txt
+curl -sf "$REPO_URL/autoscaler/ocp-autoscaler.service" -o $WEB_ROOT/autoscaler/ocp-autoscaler.service
+curl -sf "$REPO_URL/scripts/node-init.sh.tpl"          -o $WEB_ROOT/scripts/node-init.sh.tpl
+
+cp $INSTALL_DIR/auth/kubeconfig $WEB_ROOT/auth/kubeconfig
+chmod 644 $WEB_ROOT/auth/kubeconfig
+
+chown -R www-data:www-data $WEB_ROOT/autoscaler $WEB_ROOT/auth $WEB_ROOT/scripts
+echo "==> All files published"
+# ── 20. Permanent CSR approval loop ──────────────────────────────────────────
+echo "==> Starting permanent CSR watcher..."
+while true; do
+  PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
+  [ -n "$PENDING" ] && echo "$PENDING" | xargs oc adm certificate approve
+  sleep 30
+done &
+
+# ── 21. Permanent volume swap watcher for new nodes ──────────────────────────
+echo "==> Starting volume swap watcher..."
+KNOWN_NODES="$NODE_IPS"
+while true; do
+  for STATUS_FILE in $WEB_ROOT/status/worker*; do
+    [ -f "$STATUS_FILE" ] || continue
+    NODE=$(basename $STATUS_FILE)
+    STATUS=$(cat $STATUS_FILE 2>/dev/null || echo "pending")
+    if [ "$STATUS" = "done" ] && ! echo "$KNOWN_NODES" | grep -q "$NODE"; then
+      echo "==> New node $NODE completed coreos-installer, swapping volume..."
+      INDEX=$(echo $NODE | sed 's/worker//')
+      NEW_IP="$BASE_WORKER_IP.$((BASE_WORKER_OFFSET + INDEX))"
+      swap_volume $NEW_IP
+      KNOWN_NODES="$KNOWN_NODES $NODE"
+    fi
+  done
+  sleep 30
+done &

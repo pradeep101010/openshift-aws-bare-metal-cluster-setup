@@ -1,0 +1,22 @@
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  name: worker-autoscale
+  namespace: openshift-machine-api
+  labels:
+    machine.openshift.io/cluster-api-cluster: ${cluster_name}
+spec:
+  replicas: ${worker_count}
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-machineset: worker-autoscale
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-machineset: worker-autoscale
+        machine.openshift.io/cluster-api-cluster: ${cluster_name}
+    spec:
+      providerSpec:
+        value:
+          apiVersion: machine.openshift.io/v1beta1
+          kind: None

@@ -1,0 +1,33 @@
+[Unit]
+Description=OCP Autoscaler Webhook + Watcher
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/autoscaler
+Environment=KUBECONFIG=/opt/autoscaler/kubeconfig
+Environment=CLUSTER_NAME=__CLUSTER_NAME__
+Environment=BASTION_IP=__BASTION_IP__
+Environment=BOOTSTRAP_IP=__BOOTSTRAP_IP__
+Environment=BASE_DOMAIN=__BASE_DOMAIN__
+Environment=UBUNTU_AMI=__UBUNTU_AMI__
+Environment=NODE_INSTANCE_TYPE=m5.metal
+Environment=SUBNET_ID=__SUBNET_ID__
+Environment=NODE_SG_ID=__NODE_SG_ID__
+Environment=IAM_PROFILE=__IAM_PROFILE__
+Environment=REGION=__REGION__
+Environment=AZ=__AZ__
+Environment=MIN_WORKERS=2
+Environment=MAX_WORKERS=10
+Environment=WEBHOOK_URL=http://localhost:8080/scale
+Environment=BASE_WORKER_IP=10.0.1
+Environment=BASE_WORKER_OFFSET=24
+ExecStart=/bin/bash -c \
+  'python3 /opt/autoscaler/webhook.py & \
+   python3 /opt/autoscaler/watcher.py'
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

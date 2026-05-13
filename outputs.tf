@@ -7,13 +7,29 @@ output "bastion_private_ip" {
   value = aws_instance.bastion.private_ip
 }
 
-output "node_ips" {
-  description = "Private IPs of all OCP nodes"
+output "autoscaler_public_ip" {
+  value = aws_instance.autoscaler.public_ip
+}
+
+# fixed nodes — bootstrap + masters
+output "fixed_node_ips" {
+  description = "Private IPs of bootstrap and master nodes"
   value = {
     for k, v in aws_instance.ocp_node : k => {
       private_ip = v.private_ip
       public_ip  = v.public_ip
-      role       = local.nodes[k].role
+      role       = local.fixed_nodes[k].role
+    }
+  }
+}
+
+# dynamic workers
+output "worker_ips" {
+  description = "Private IPs of worker nodes"
+  value = {
+    for k, v in aws_instance.worker : k => {
+      private_ip = v.private_ip
+      public_ip  = v.public_ip
     }
   }
 }
@@ -31,8 +47,19 @@ output "cluster_console_url" {
 output "ssh_commands" {
   description = "Useful SSH commands"
   value = {
-    bastion   = "ssh -i <key.pem> ubuntu@${aws_instance.bastion.public_ip}"
-    bootstrap = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.bootstrap_ip}"
-    master0   = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.master_ips[0]}"
+    bastion    = "ssh -i <key.pem> ubuntu@${aws_instance.bastion.public_ip}"
+    autoscaler = "ssh -i <key.pem> ubuntu@${aws_instance.autoscaler.public_ip}"
+    bootstrap  = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.bootstrap_ip}"
+    master0    = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.master_ips[0]}"
+    master1    = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.master_ips[1]}"
+    master2    = "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${local.master_ips[2]}"
+  }
+}
+
+output "worker_ssh_commands" {
+  description = "SSH commands for all workers (dynamic)"
+  value = {
+    for k, v in aws_instance.worker :
+    k => "ssh -i <key.pem> -J ubuntu@${aws_instance.bastion.public_ip} core@${v.private_ip}"
   }
 }
