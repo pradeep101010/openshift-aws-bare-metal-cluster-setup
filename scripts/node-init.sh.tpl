@@ -87,9 +87,8 @@ lsblk
 
 # ── Fix 5: Notify bastion — it handles volume swap ────────────────────────────
 echo "==> Notifying bastion of completion"
-curl -sf "http://$BASTION_IP/status-update/$NODE_NAME" || \
-  echo "WARNING: CGI notification failed"
-echo "done" > /var/lib/rhcos-installed
+curl -sf "http://$BASTION_IP/cgi-bin/status-update.sh?$NODE_NAME" \
+  || echo "WARNING: status notification failed"
 
 echo "==> Node init complete. Bastion will now perform volume swap."
 echo "==> This node will be stopped, volume swapped, and restarted into RHCOS."

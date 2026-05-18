@@ -113,25 +113,29 @@ cat > /etc/apache2/conf-available/ocp.conf << 'APACHEEOF'
     AllowOverride None
     Require all granted
 </Directory>
-ScriptAlias /status-update/ /usr/lib/cgi-bin/
+
+ScriptAlias /cgi-bin/ /usr/lib/cgi-bin/
+
 <Directory /usr/lib/cgi-bin>
     Options +ExecCGI
+    AddHandler cgi-script .sh
     Require all granted
 </Directory>
 APACHEEOF
 
-# CGI script so nodes can notify bastion via simple GET
-cat > /usr/lib/cgi-bin/status-update << 'CGIEOF'
+# CGI script so nodes can notify bastion via simple GET with query string
+cat > /usr/lib/cgi-bin/status-update.sh << 'CGIEOF'
 #!/bin/bash
-NODE=$(echo "$PATH_INFO" | tr -d '/' | tr -cd '[:alnum:]-_')
+NODE=$(echo "$QUERY_STRING" | tr -cd '[:alnum:]-_')
 if [ -n "$NODE" ]; then
   echo "done" > /var/www/html/status/$NODE
+  chown www-data:www-data /var/www/html/status/$NODE 2>/dev/null
   printf "Content-Type: text/plain\r\n\r\nok\n"
 else
   printf "Content-Type: text/plain\r\n\r\nerror: no node name\n"
 fi
 CGIEOF
-chmod +x /usr/lib/cgi-bin/status-update
+chmod +x /usr/lib/cgi-bin/status-update.sh
 
 a2enconf ocp
 systemctl enable apache2
@@ -224,6 +228,20 @@ $MASTER0_IP etcd-0.$CLUSTER_DOMAIN
 $MASTER1_IP etcd-1.$CLUSTER_DOMAIN
 $MASTER2_IP etcd-2.$CLUSTER_DOMAIN
 EOF
+
+# ── 8b. SSH config: auto-accept host keys for internal nodes ─────────────────
+# Nodes get rebuilt frequently (OS reinstalls, volume swaps, autoscaler churn),
+# so their host keys change. Skip strict checking on the internal subnet.
+mkdir -p /home/ubuntu/.ssh
+cat >> /home/ubuntu/.ssh/config << 'EOF'
+
+Host 10.0.1.*
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+EOF
+chmod 600 /home/ubuntu/.ssh/config
+chown ubuntu:ubuntu /home/ubuntu/.ssh/config
 
 # ── 9. Node status tracking ───────────────────────────────────────────────────
 for node in bootstrap master0 master1 master2; do

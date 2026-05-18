@@ -50,9 +50,15 @@ resource "aws_iam_role_policy" "ocp_node_ec2" {
         Resource = "*"
       },
       {
-        # SSM for remote debugging
-        Effect   = "Allow"
-        Action   = ["ssm:*", "ssmmessages:*", "ec2messages:*"]
+        # SSM for remote debugging + console output
+        Effect = "Allow"
+        Action = [
+          "ssm:*",
+          "ssmmessages:*",
+          "ec2messages:*",
+          "ec2:GetConsoleOutput",
+          "ec2:GetConsoleScreenshot",
+        ]
         Resource = "*"
       },
       {

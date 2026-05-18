@@ -102,6 +102,11 @@ resource "aws_instance" "ocp_node" {
     Name    = "${var.cluster_name}-${each.key}"
     OCPRole = each.value.role
   })
+   metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"      # IMDSv2
+    instance_metadata_tags      = "enabled"       
+  }
 }
 
 # ── Dynamic Worker Nodes ───────────────────────────────────────────────────────
@@ -122,6 +127,12 @@ resource "aws_instance" "worker" {
     volume_type           = "gp3"
     volume_size           = 20
     delete_on_termination = true
+  }
+
+  metadata_options {
+    http_endpoint          = "enabled"
+    http_tokens            = "required"
+    instance_metadata_tags = "enabled"
   }
 
   user_data = base64encode(templatefile("${path.module}/scripts/node-init.sh.tpl", {

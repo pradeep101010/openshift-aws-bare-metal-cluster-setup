@@ -162,6 +162,8 @@ def scale_up(desired):
         f"--iam-instance-profile Name={IAM_PROFILE} "
         f"--security-group-ids {NODE_SG_ID} "
         f"--placement AvailabilityZone={AZ} "
+        f"--metadata-options "
+        f"'HttpEndpoint=enabled,HttpTokens=required,InstanceMetadataTags=enabled' "
         f"--user-data '{get_node_userdata(new_index)}' "
         f"--tag-specifications "
         f"'ResourceType=instance,Tags=["
