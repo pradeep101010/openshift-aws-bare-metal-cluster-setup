@@ -48,8 +48,13 @@ variable "ssh_public_key" {
   default     = null                  # null = read from file instead
 }
 
+variable "node_ssh_private_key_path" {
+  type        = string
+  default = "/Users/pradeepsn/Downloads/openshift-poc-rhcos-node.pem"
+}
 locals {
   ssh_public_key = var.ssh_public_key != null ? var.ssh_public_key : file(pathexpand(var.ssh_public_key_path))
+  node_ssh_private_key = file(pathexpand(var.node_ssh_private_key_path))
 }
 
 # ── Rest of variables ──────────────────────────────────────────
