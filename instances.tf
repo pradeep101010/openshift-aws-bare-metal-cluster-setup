@@ -28,6 +28,7 @@ resource "aws_instance" "bastion" {
     ocp_version             = var.ocp_version
     pull_secret             = var.pull_secret
     ssh_public_key          = local.ssh_public_key
+    node_ssh_private_key = file("${path.module}/openshift-poc-rhcos-node.pem")
     bastion_ip              = local.bastion_ip
     bootstrap_ip            = local.bootstrap_ip
     master0_ip              = local.master_ips[0]

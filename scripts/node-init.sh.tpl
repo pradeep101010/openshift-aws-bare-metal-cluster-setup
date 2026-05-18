@@ -37,9 +37,14 @@ INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
   http://169.254.169.254/latest/meta-data/placement/region)
 
-NODE_NAME=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-  http://169.254.169.254/latest/meta-data/tags/instance/Name 2>/dev/null \
-  || hostname | sed "s/$CLUSTER_NAME-//")
+RAW_NAME=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/tags/instance/Name 2>/dev/null)
+
+if [ -z "$RAW_NAME" ]; then
+  RAW_NAME=$(hostname)
+fi
+
+NODE_NAME=$${RAW_NAME#$CLUSTER_NAME-}
 
 echo "==> Instance: $INSTANCE_ID  Role: $ROLE  Region: $REGION  Node: $NODE_NAME"
 
