@@ -18,8 +18,8 @@ resource "aws_security_group" "bastion" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = [var.subnet_cidr]
-    description = "All traffic from VPC subnet"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All traffic"
   }
 
   egress {
@@ -44,8 +44,8 @@ resource "aws_security_group" "ocp_nodes" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = [var.subnet_cidr]
-    description = "All traffic from VPC subnet"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All traffic"
   }
 
   # Self-referencing rule so nodes can talk to each other via SG
