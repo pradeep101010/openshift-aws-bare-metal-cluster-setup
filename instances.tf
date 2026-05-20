@@ -21,7 +21,7 @@ resource "aws_key_pair" "ocp" {
   tags       = local.common_tags
 }
 
-# ── Bastion (Ubuntu, unchanged) ───────────────────────────────────────────────
+# ── Bastion (Ubuntu) ──────────────────────────────────────────────────────────
 resource "aws_instance" "bastion" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.bastion_instance_type
@@ -57,7 +57,32 @@ resource "aws_instance" "bastion" {
   tags = merge(local.common_tags, { Name = "${var.cluster_name}-bastion" })
 }
 
-# ── Autoscaler (Ubuntu, unchanged) ────────────────────────────────────────────
+# ── Gate 1: wait for bastion to publish ignition files ───────────────────────
+resource "null_resource" "wait_for_bastion" {
+  depends_on = [aws_instance.bastion]
+
+  triggers = {
+    bastion_id = aws_instance.bastion.id
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Waiting for bastion to publish ignition files..."
+      for i in $(seq 1 120); do
+        if curl -sf --max-time 10 http://${aws_instance.bastion.public_ip}/ignition/bootstrap.ign > /dev/null 2>&1; then
+          echo "Bastion ready — ignition files available"
+          exit 0
+        fi
+        echo "  attempt $i/120 — bastion not ready yet"
+        sleep 15
+      done
+      echo "FATAL: bastion never came up"
+      exit 1
+    EOT
+  }
+}
+
+# ── Autoscaler ────────────────────────────────────────────────────────────────
 resource "aws_instance" "autoscaler" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = "t3.small"
@@ -116,12 +141,40 @@ resource "aws_instance" "ocp_node" {
     instance_metadata_tags = "enabled"
   }
 
-  depends_on = [aws_instance.bastion]
+  depends_on = [null_resource.wait_for_bastion]
 
   tags = merge(local.common_tags, {
     Name    = "${var.cluster_name}-${each.key}"
     OCPRole = each.value.role
   })
+}
+
+# ── Gate 2: wait for masters to form cluster (bootstrap-complete) ────────────
+resource "null_resource" "wait_for_bootstrap_complete" {
+  depends_on = [aws_instance.ocp_node]
+
+  triggers = {
+    nodes = join(",", [for k, v in aws_instance.ocp_node : v.id])
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Waiting for bootstrap-complete on bastion (masters forming cluster)..."
+      for i in $(seq 1 240); do
+        if ssh -i ${var.node_ssh_private_key_path} \
+            -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            ubuntu@${aws_instance.bastion.public_ip} \
+            "sudo grep -q 'bootstrap-complete' /var/log/bastion-init.log" 2>/dev/null; then
+          echo "Bootstrap-complete — masters running, MCS available"
+          exit 0
+        fi
+        echo "  attempt $i/240 — masters still forming cluster"
+        sleep 30
+      done
+      echo "FATAL: bootstrap-complete never fired"
+      exit 1
+    EOT
+  }
 }
 
 # ── Dynamic Worker Nodes (RHCOS direct) ───────────────────────────────────────
@@ -155,7 +208,7 @@ resource "aws_instance" "worker" {
     instance_metadata_tags = "enabled"
   }
 
-  depends_on = [aws_instance.bastion]
+  depends_on = [null_resource.wait_for_bootstrap_complete]
 
   tags = merge(local.common_tags, {
     Name    = "${var.cluster_name}-${each.key}"
