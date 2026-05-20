@@ -337,27 +337,29 @@ swap_volume() {
   echo "==> Volume swap complete for $IP"
 }
 
-# ── 13. Volume swap for all nodes in parallel ─────────────────────────────────
-echo "==> Starting volume swap for all nodes in parallel"
+# ── 13. Volume swap: bootstrap FIRST ──────────────────────────────────────────
+echo "==> Phase 1: Volume swap for bootstrap"
+swap_volume $BOOTSTRAP_IP
+
+echo "==> Waiting for bootstrap to boot RHCOS..."
+until ssh -i /home/ubuntu/.ssh/openshift-poc-rhcos-node.pem \
+  -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+  core@$BOOTSTRAP_IP "hostname" > /dev/null 2>&1; do
+  sleep 15
+done
+echo "==> Bootstrap RHCOS up, MCS serving on :22623"
+
+# ── 14. Volume swap: MASTERS in parallel ──────────────────────────────────────
+echo "==> Phase 2: Volume swap for masters"
 PIDS=()
-for IP in $NODE_IPS; do
+for IP in $MASTER0_IP $MASTER1_IP $MASTER2_IP; do
   swap_volume $IP &
   PIDS+=($!)
-  echo "  Swap launched for $IP (PID $!)"
 done
+for PID in "${PIDS[@]}"; do wait $PID; done
 
-# Wait for all swaps to complete
-for PID in "${PIDS[@]}"; do
-  wait $PID && echo "  PID $PID completed" || echo "  PID $PID failed"
-done
-echo "==> All nodes booting into RHCOS"
-
-# ── 14. Wait for nodes to boot RHCOS ─────────────────────────────────────────
-echo "==> Waiting for all nodes to boot RHCOS..."
-export KUBECONFIG=$INSTALL_DIR/auth/kubeconfig
-
-for IP in $NODE_IPS; do
-  echo "  Waiting for $IP..."
+echo "==> Waiting for masters to boot RHCOS..."
+for IP in $MASTER0_IP $MASTER1_IP $MASTER2_IP; do
   until ssh -i /home/ubuntu/.ssh/openshift-poc-rhcos-node.pem \
     -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
     core@$IP "hostname" > /dev/null 2>&1; do
@@ -366,35 +368,49 @@ for IP in $NODE_IPS; do
   echo "  $IP is running RHCOS"
 done
 
-# ── 15. Update DNS from bootstrap to master0 after bootstrap ─────────────────
-echo "==> Waiting for bootstrap-complete..."
+# ── 15. Wait for bootstrap-complete + flip DNS ────────────────────────────────
+echo "==> Phase 3: Waiting for bootstrap-complete (masters form cluster, MCS pods up)"
 chown -R ubuntu:ubuntu $INSTALL_DIR
 
 sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
 
-echo "==> Updating DNS: api.* → master0 ($MASTER0_IP)"
+echo "==> Flipping DNS: api.* → master0 ($MASTER0_IP)"
 sed -i "s|address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
 sed -i "s|address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api-int.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
 sed -i "s|$BOOTSTRAP_IP api.$CLUSTER_DOMAIN|$MASTER0_IP api.$CLUSTER_DOMAIN|" /etc/hosts
 systemctl restart dnsmasq
-echo "==> DNS updated: api.$CLUSTER_DOMAIN → $(dig +short @127.0.0.1 api.$CLUSTER_DOMAIN)"
+echo "==> DNS flipped: api.$CLUSTER_DOMAIN → $(dig +short @127.0.0.1 api.$CLUSTER_DOMAIN)"
 
-# ── 16. Approve worker CSRs ───────────────────────────────────────────────────
-echo "==> Approving worker CSRs..."
-for round in 1 2; do
-  echo "  Round $round..."
-  sleep 60
-  PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
-  if [ -n "$PENDING" ]; then
-    echo "$PENDING" | xargs oc adm certificate approve
-    echo "  Approved: $PENDING"
-  else
-    echo "  No pending CSRs in round $round"
-  fi
+export KUBECONFIG=$INSTALL_DIR/auth/kubeconfig
+
+# ── 16. Volume swap: WORKERS in parallel (NOW masters are serving MCS) ────────
+echo "==> Phase 4: Volume swap for workers"
+PIDS=()
+for IP in $WORKER_IPS; do
+  swap_volume $IP &
+  PIDS+=($!)
+done
+for PID in "${PIDS[@]}"; do wait $PID; done
+
+echo "==> Waiting for workers to boot RHCOS..."
+for IP in $WORKER_IPS; do
+  until ssh -i /home/ubuntu/.ssh/openshift-poc-rhcos-node.pem \
+    -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+    core@$IP "hostname" > /dev/null 2>&1; do
+    sleep 15
+  done
+  echo "  $IP is running RHCOS"
 done
 
-# keep approving until all nodes ready
+# ── 17a. Approve worker CSRs ───────────────────────────────────────────────────
+echo "==> Approving worker CSRs..."
+for round in 1 2; do
+  sleep 60
+  PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
+  [ -n "$PENDING" ] && echo "$PENDING" | xargs oc adm certificate approve
+done
+
 echo "==> Waiting for all $EXPECTED_NODES nodes to be Ready..."
 until [ "$(oc get nodes --no-headers 2>/dev/null | grep -c Ready)" = "$EXPECTED_NODES" ]; do
   PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
@@ -404,8 +420,7 @@ done
 
 echo "==> All $EXPECTED_NODES nodes Ready!"
 oc get nodes
-
-# ── 17. Wait for install complete ────────────────────────────────────────────
+# ── 17b. Wait for install complete ────────────────────────────────────────────
 echo "==> Waiting for install-complete (this takes 30-45 min)..."
 sudo -u ubuntu openshift-install wait-for install-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log
@@ -418,7 +433,7 @@ echo " API:     https://api.$CLUSTER_DOMAIN:6443"
 echo " kubeadmin password: $(cat $INSTALL_DIR/auth/kubeadmin-password)"
 echo "============================================"
 
-# ── 17b. Terminate bootstrap node ────────────────────────────────────────────
+# ── 17c. Terminate bootstrap node ────────────────────────────────────────────
 echo "==> Terminating bootstrap node"
 BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
   --filters "Name=private-ip-address,Values=$BOOTSTRAP_IP" \
