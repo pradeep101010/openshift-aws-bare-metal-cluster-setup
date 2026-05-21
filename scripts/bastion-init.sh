@@ -171,7 +171,7 @@ echo "==> BASTION READY — ignition files served, nodes will fetch on boot"
 chown -R ubuntu:ubuntu $INSTALL_DIR
 sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
-echo "==> BOOTSTRAP-COMPLETE-MARKER"
+echo "==> bootstrap-complete reached"
 
 # ── 12. Flip DNS bootstrap → master0 ──────────────────────────────────────────
 sed -i "s|address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
