@@ -4,14 +4,14 @@ metadata:
   name: worker-autoscale
   namespace: openshift-machine-api
   labels:
-    machine.openshift.io/cluster-api-cluster: ${cluster_name}
+    machine.openshift.io/cluster-api-cluster: __CLUSTER_NAME__
   annotations:
     machine.openshift.io/cpu: "96"
     machine.openshift.io/memory: "393216Mi"
     machine.openshift.io/gpu-count: "0"
     machine.openshift.io/gpu-type: ""
 spec:
-  replicas: ${worker_count}
+  replicas: __WORKER_COUNT__
   selector:
     matchLabels:
       machine.openshift.io/cluster-api-machineset: worker-autoscale
@@ -19,7 +19,7 @@ spec:
     metadata:
       labels:
         machine.openshift.io/cluster-api-machineset: worker-autoscale
-        machine.openshift.io/cluster-api-cluster: ${cluster_name}
+        machine.openshift.io/cluster-api-cluster: __CLUSTER_NAME__
     spec:
       providerSpec:
         value:

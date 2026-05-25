@@ -40,7 +40,11 @@ nameserver 127.0.0.1
 nameserver 169.254.169.253
 EOF
 
-FIRST_WORKER_IP=$(echo $WORKER_IPS | awk '{print $1}')
+# Build one *.apps record per worker — dnsmasq round-robins across them
+APPS_RECORDS=""
+for ip in $WORKER_IPS; do
+  APPS_RECORDS="${APPS_RECORDS}address=/.apps.$CLUSTER_DOMAIN/$ip"$'\n'
+done
 
 cat > /etc/dnsmasq.conf << EOF
 port=53
@@ -50,8 +54,7 @@ server=169.254.169.253
 
 address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP
 address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP
-address=/.apps.$CLUSTER_DOMAIN/$FIRST_WORKER_IP
-
+${APPS_RECORDS}
 address=/etcd-0.$CLUSTER_DOMAIN/$MASTER0_IP
 address=/etcd-1.$CLUSTER_DOMAIN/$MASTER1_IP
 address=/etcd-2.$CLUSTER_DOMAIN/$MASTER2_IP
@@ -198,14 +201,43 @@ done
 sudo -u ubuntu openshift-install wait-for install-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log
 
-# ── 15. Terminate bootstrap ───────────────────────────────────────────────────
+# ── 15. Patch mastersSchedulable: false and reschedule routers ────────────────
+# Masters were schedulable during install (compute.replicas=0). Now that real
+# workers exist, take the worker role off masters so workloads (including
+# routers) only land on workers.
+echo "==> Patching mastersSchedulable=false"
+oc patch scheduler cluster --type=merge -p '{"spec":{"mastersSchedulable":false}}'
+
+# Existing router pods stay on masters until evicted — delete them so the
+# deployment recreates them onto the (now only) worker nodes.
+echo "==> Forcing router pods to reschedule onto workers"
+oc -n openshift-ingress delete pod --all
+
+# Wait for all router pods to come back Running
+echo "==> Waiting for routers to be Running..."
+for i in $(seq 1 30); do
+  TOTAL=$(oc -n openshift-ingress get pods --no-headers 2>/dev/null | wc -l)
+  RUNNING=$(oc -n openshift-ingress get pods --no-headers 2>/dev/null | grep -c Running || echo 0)
+  if [ "$RUNNING" -ge "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+    echo "==> All $TOTAL router pods Running"
+    break
+  fi
+  echo "  attempt $i/30 — $RUNNING/$TOTAL routers Running"
+  sleep 10
+done
+
+# Let cluster operators (auth, console) recover after router move
+sleep 30
+echo "==> Master/worker separation complete"
+
+# ── 16. Terminate bootstrap ───────────────────────────────────────────────────
 BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
   --filters "Name=private-ip-address,Values=$BOOTSTRAP_IP" \
   --query 'Reservations[0].Instances[0].InstanceId' \
   --region "$REGION" --output text)
 aws ec2 terminate-instances --instance-ids "$BOOTSTRAP_INSTANCE" --region "$REGION"
 
-# ── 16. Apply autoscaler manifests ────────────────────────────────────────────
+# ── 17. Apply autoscaler manifests ────────────────────────────────────────────
 REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main"
 
 curl -sf "$REPO_URL/autoscaler/manifests/machineset.yaml" \
@@ -215,7 +247,7 @@ curl -sf "$REPO_URL/autoscaler/manifests/cluster-autoscaler.yaml" | oc apply -f 
 curl -sf "$REPO_URL/autoscaler/manifests/machine-autoscaler.yaml" \
   | sed "s/__WORKER_COUNT__/$WORKER_COUNT/g" | oc apply -f -
 
-# ── 17. Publish autoscaler files ──────────────────────────────────────────────
+# ── 18. Publish autoscaler files ──────────────────────────────────────────────
 mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth
 curl -sf "$REPO_URL/autoscaler/webhook.py"             -o $WEB_ROOT/autoscaler/webhook.py
 curl -sf "$REPO_URL/autoscaler/watcher.py"             -o $WEB_ROOT/autoscaler/watcher.py
@@ -226,7 +258,8 @@ cp $INSTALL_DIR/auth/kubeconfig $WEB_ROOT/auth/kubeconfig
 chmod 644 $WEB_ROOT/auth/kubeconfig
 chown -R www-data:www-data $WEB_ROOT/autoscaler $WEB_ROOT/auth
 
-# ── 18. Permanent CSR approval service ────────────────────────────────────────
+
+# ── 19. Permanent CSR approval service ────────────────────────────────────────
 curl -sf "$REPO_URL/scripts/csr-approver.service" \
   -o /etc/systemd/system/csr-approver.service
 
