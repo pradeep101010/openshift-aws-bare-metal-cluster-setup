@@ -153,7 +153,6 @@ chown -R www-data:www-data $WEB_ROOT
 
 # ── 8. /etc/hosts ─────────────────────────────────────────────────────────────
 cat >> /etc/hosts << EOF
-$BOOTSTRAP_IP api.$CLUSTER_DOMAIN api-int.$CLUSTER_DOMAIN
 $MASTER0_IP etcd-0.$CLUSTER_DOMAIN
 $MASTER1_IP etcd-1.$CLUSTER_DOMAIN
 $MASTER2_IP etcd-2.$CLUSTER_DOMAIN
@@ -176,13 +175,45 @@ sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
 echo "==> bootstrap-complete reached"
 
-# ── 12. Flip DNS bootstrap → master0 ──────────────────────────────────────────
-sed -i "s|address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
-sed -i "s|address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|address=/api-int.$CLUSTER_DOMAIN/$MASTER0_IP|" /etc/dnsmasq.conf
-sed -i "s|$BOOTSTRAP_IP api.$CLUSTER_DOMAIN|$MASTER0_IP api.$CLUSTER_DOMAIN|" /etc/hosts
+# ── 12. Flip DNS bootstrap → masters (round-robin across all 3) ───────────────
+# Was: single sed pin to MASTER0_IP. That's a single point of failure — if
+# master0 has any issue, the bastion (and anything resolving via it) loses
+# access to the cluster API entirely.
+#
+# Instead, write 3 address records for api and 3 for api-int — dnsmasq
+# round-robins among them. Surviving any one master failure is automatic.
+
+# Remove the old bootstrap-pinned entries
+sed -i "\|address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|d"     /etc/dnsmasq.conf
+sed -i "\|address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|d" /etc/dnsmasq.conf
+
+# Write 3 lines each for api and api-int
+cat >> /etc/dnsmasq.conf <<EOF
+
+# API endpoints — round-robin across all masters
+address=/api.$CLUSTER_DOMAIN/$MASTER0_IP
+address=/api.$CLUSTER_DOMAIN/$MASTER1_IP
+address=/api.$CLUSTER_DOMAIN/$MASTER2_IP
+address=/api-int.$CLUSTER_DOMAIN/$MASTER0_IP
+address=/api-int.$CLUSTER_DOMAIN/$MASTER1_IP
+address=/api-int.$CLUSTER_DOMAIN/$MASTER2_IP
+EOF
+
+# /etc/hosts can't round-robin (only first match wins), so remove api entries
+# entirely and let dnsmasq handle resolution.
+sed -i "/api\.$CLUSTER_DOMAIN/d" /etc/hosts
+sed -i "/api-int\.$CLUSTER_DOMAIN/d" /etc/hosts
+
+# Validate before restarting
+if ! dnsmasq --test 2>&1; then
+  echo "FATAL: dnsmasq config invalid"
+  cat /etc/dnsmasq.conf
+  exit 1
+fi
+
 systemctl restart dnsmasq
 
-export KUBECONFIG=$INSTALL_DIR/auth/kubeconfig
+echo "==> DNS flipped to round-robin across masters"
 
 # ── 13. Approve worker CSRs ───────────────────────────────────────────────────
 for round in 1 2; do
@@ -277,6 +308,7 @@ curl -sf "$REPO_URL/autoscaler/manifests/machine-autoscaler.yaml" \
   | sed "s/__WORKER_COUNT__/$WORKER_COUNT/g" | oc apply -f -
 
 # ── 18. Publish autoscaler files ──────────────────────────────────────────────
+mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth $WEB_ROOT/scripts 
 mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth
 curl -sf "$REPO_URL/autoscaler/webhook.py"             -o $WEB_ROOT/autoscaler/webhook.py
 curl -sf "$REPO_URL/autoscaler/watcher.py"             -o $WEB_ROOT/autoscaler/watcher.py
