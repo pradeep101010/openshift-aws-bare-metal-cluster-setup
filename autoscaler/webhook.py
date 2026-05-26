@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import subprocess, logging, os, time, base64
+import subprocess, logging, os, time, tempfile
 from flask import Flask, request, jsonify
 from kubernetes import client, config
 
@@ -13,9 +13,9 @@ logging.basicConfig(
 KUBECONFIG          = os.environ.get('KUBECONFIG',          '/opt/autoscaler/kubeconfig')
 CLUSTER_NAME        = os.environ.get('CLUSTER_NAME',        'ocp-poc')
 BASTION_IP          = os.environ.get('BASTION_IP',          '')
-BOOTSTRAP_IP        = os.environ.get('BOOTSTRAP_IP',        '')
-BASE_DOMAIN         = os.environ.get('BASE_DOMAIN',         '')
-UBUNTU_AMI          = os.environ.get('UBUNTU_AMI',          '')
+RHCOS_AMI           = os.environ.get('RHCOS_AMI',           '')
+KEY_PAIR_NAME       = os.environ.get('KEY_PAIR_NAME',       '')
+RHCOS_DISK_SIZE_GB  = int(os.environ.get('RHCOS_DISK_SIZE_GB', '130'))
 NODE_INSTANCE_TYPE  = os.environ.get('NODE_INSTANCE_TYPE',  'm5.metal')
 SUBNET_ID           = os.environ.get('SUBNET_ID',           '')
 NODE_SG_ID          = os.environ.get('NODE_SG_ID',          '')
@@ -26,6 +26,8 @@ MIN_WORKERS         = int(os.environ.get('MIN_WORKERS',     '2'))
 MAX_WORKERS         = int(os.environ.get('MAX_WORKERS',     '10'))
 BASE_WORKER_IP      = os.environ.get('BASE_WORKER_IP',      '10.0.1')
 BASE_WORKER_OFFSET  = int(os.environ.get('BASE_WORKER_OFFSET', '24'))
+
+STUB_TEMPLATE_PATH  = '/opt/autoscaler/scripts/ignition-stub.json.tpl'
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def run(cmd, cwd=None):
@@ -62,22 +64,41 @@ def get_instance_id_by_ip(ip):
     result = run(
         f"aws ec2 describe-instances "
         f"--filters 'Name=private-ip-address,Values={ip}' "
-        f"'Name=instance-state-name,Values=running' "
+        f"'Name=instance-state-name,Values=running,pending' "
         f"--query 'Reservations[0].Instances[0].InstanceId' "
         f"--region {REGION} --output text"
     )
     return result.stdout.strip()
 
-def get_node_userdata(index):
-    with open("/opt/autoscaler/scripts/node-init.sh.tpl") as f:
+def find_used_worker_ips():
+    """Return set of IPs already taken by running/pending worker EC2s.
+       Used to find the next free IP when scaling — prevents collisions after
+       scale-down/scale-up cycles."""
+    result = run(
+        f"aws ec2 describe-instances "
+        f"--filters 'Name=tag:OCPRole,Values=worker' "
+        f"'Name=instance-state-name,Values=running,pending,stopping,stopped' "
+        f"--query 'Reservations[].Instances[].PrivateIpAddress' "
+        f"--region {REGION} --output text"
+    )
+    return set(result.stdout.strip().split())
+
+def pick_next_worker_slot():
+    """Find the first free (index, ip) in our worker range."""
+    used = find_used_worker_ips()
+    for offset in range(0, MAX_WORKERS + 5):
+        candidate_ip = f"{BASE_WORKER_IP}.{BASE_WORKER_OFFSET + offset}"
+        if candidate_ip not in used:
+            return offset, candidate_ip
+    raise RuntimeError("No free worker IP available in range")
+
+def render_ignition_stub(role='worker'):
+    """Render the ignition stub for a new RHCOS worker — same template the
+       Terraform-launched initial workers use."""
+    with open(STUB_TEMPLATE_PATH) as f:
         template = f.read()
-    script = template \
-        .replace("${bastion_ip}",   BASTION_IP) \
-        .replace("${bootstrap_ip}", BOOTSTRAP_IP) \
-        .replace("${role}",         "worker") \
-        .replace("${cluster_name}", CLUSTER_NAME) \
-        .replace("${base_domain}",  BASE_DOMAIN)
-    return base64.b64encode(script.encode()).decode()
+    return template.replace('${bastion_ip}', BASTION_IP) \
+                   .replace('${role}',       role)
 
 def update_machineset_replicas(count):
     crd = get_kube_client()
@@ -92,7 +113,7 @@ def update_machineset_replicas(count):
     logging.info(f"MachineSet spec.replicas updated to {count}")
 
 def update_machineset_status(ready_count):
-    """Update MachineSet status so ClusterAutoscaler sees reality and stops retrying"""
+    """Update MachineSet status field to reflect reality."""
     crd = get_kube_client()
     crd.patch_namespaced_custom_object_status(
         group="machine.openshift.io",
@@ -111,7 +132,7 @@ def update_machineset_status(ready_count):
     logging.info(f"MachineSet status updated: readyReplicas={ready_count}")
 
 def wait_for_node_ready(expected_count, timeout=1800):
-    """Wait until expected number of workers are Ready in cluster"""
+    """Wait until expected number of workers are Ready in cluster."""
     logging.info(f"Waiting for {expected_count} workers to be Ready...")
     start = time.time()
     while time.time() - start < timeout:
@@ -125,6 +146,7 @@ def wait_for_node_ready(expected_count, timeout=1800):
     return False
 
 def drain_last_worker():
+    """Drain and return the name of the most recently created worker."""
     result = run(
         f"oc get nodes -l node-role.kubernetes.io/worker "
         f"--no-headers --sort-by=.metadata.creationTimestamp "
@@ -144,27 +166,36 @@ def drain_last_worker():
     )
     return last_worker
 
-# ── Scale up ──────────────────────────────────────────────────────────────────
-def scale_up(desired):
-    current   = get_worker_count()
-    new_index = current
-    new_ip    = f"{BASE_WORKER_IP}.{BASE_WORKER_OFFSET + new_index}"
+# ── Provision one worker (called by scale_up loop) ────────────────────────────
+def provision_one_worker():
+    """Launch a single RHCOS worker. Returns the new IP on success, None on failure."""
+    new_index, new_ip = pick_next_worker_slot()
+    logging.info(f"==> Provisioning worker at index={new_index} ip={new_ip}")
 
-    logging.info(f"==> Provisioning worker{new_index} at {new_ip}")
+    # Render ignition stub to a temp file — passed via --user-data file://
+    stub = render_ignition_stub(role='worker')
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write(stub)
+        stub_path = f.name
 
-    # launch EC2 instance
-    run(
+    result = run(
         f"aws ec2 run-instances "
-        f"--image-id {UBUNTU_AMI} "
+        f"--image-id {RHCOS_AMI} "
         f"--instance-type {NODE_INSTANCE_TYPE} "
         f"--subnet-id {SUBNET_ID} "
         f"--private-ip-address {new_ip} "
         f"--iam-instance-profile Name={IAM_PROFILE} "
         f"--security-group-ids {NODE_SG_ID} "
         f"--placement AvailabilityZone={AZ} "
+        f"--key-name {KEY_PAIR_NAME} "
+        f"--associate-public-ip-address "
         f"--metadata-options "
         f"'HttpEndpoint=enabled,HttpTokens=required,InstanceMetadataTags=enabled' "
-        f"--user-data '{get_node_userdata(new_index)}' "
+        f"--block-device-mappings "
+        f"'[{{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{{"
+        f"\"VolumeType\":\"gp3\",\"VolumeSize\":{RHCOS_DISK_SIZE_GB},"
+        f"\"DeleteOnTermination\":true}}}}]' "
+        f"--user-data file://{stub_path} "
         f"--tag-specifications "
         f"'ResourceType=instance,Tags=["
         f"{{Key=Name,Value={CLUSTER_NAME}-worker{new_index}}},"
@@ -173,90 +204,91 @@ def scale_up(desired):
         f"--region {REGION}"
     )
 
-    # wait for instance to appear
-    logging.info("Waiting for instance to start...")
-    time.sleep(30)
+    try:
+        os.unlink(stub_path)
+    except OSError:
+        pass
+
+    if result.returncode != 0:
+        logging.error(f"run-instances failed for worker{new_index}")
+        return None
+
+    time.sleep(15)
     instance_id = get_instance_id_by_ip(new_ip)
+    logging.info(f"  worker{new_index}: instance {instance_id} launched at {new_ip}")
+    return new_ip
 
-    # create RHCOS EBS volume
-    vol_result = run(
-        f"aws ec2 create-volume "
-        f"--availability-zone {AZ} "
-        f"--size 130 "
-        f"--volume-type gp3 "
-        f"--tag-specifications "
-        f"'ResourceType=volume,Tags=["
-        f"{{Key=Name,Value={CLUSTER_NAME}-worker{new_index}-rhcos}},"
-        f"{{Key=OCPRole,Value=worker}}"
-        f"]' "
-        f"--region {REGION} "
-        f"--query VolumeId --output text"
-    )
-    vol_id = vol_result.stdout.strip()
-    logging.info(f"Created RHCOS volume {vol_id}")
+# ── Scale up ──────────────────────────────────────────────────────────────────
+def scale_up(desired):
+    """Launch as many workers as needed to reach `desired`.
+       Each launch is sequential; we wait for ALL of them to be Ready at the end."""
+    current = get_worker_count()
+    to_add = desired - current
+    logging.info(f"==> scale_up: adding {to_add} workers ({current} → {desired})")
 
-    # wait for volume to be available
-    run(f"aws ec2 wait volume-available --volume-ids {vol_id} --region {REGION}")
-
-    # attach RHCOS volume
-    run(
-        f"aws ec2 attach-volume "
-        f"--volume-id {vol_id} "
-        f"--instance-id {instance_id} "
-        f"--device /dev/xvdf "
-        f"--region {REGION}"
-    )
-    logging.info(f"Attached {vol_id} to {instance_id}")
-
-    # update spec immediately so ClusterAutoscaler knows we're working on it
+    # Patch spec.replicas up-front so watchers see the target
     update_machineset_replicas(desired)
 
-    # wait for node to actually join then update status
-    # this is what tells ClusterAutoscaler the scale succeeded
-    if wait_for_node_ready(desired):
-        update_machineset_status(desired)
-    else:
-        logging.error("Node never joined — ClusterAutoscaler will retry")
+    launched = 0
+    for i in range(to_add):
+        if provision_one_worker() is not None:
+            launched += 1
+        else:
+            logging.error(f"  failed to launch worker {i+1}/{to_add} — continuing with remaining")
 
-    logging.info(f"==> worker{new_index} provisioned and MachineSet fully updated")
+    if launched == 0:
+        logging.error("scale_up: no workers launched successfully")
+        return
+
+    logging.info(f"==> Launched {launched}/{to_add} workers; waiting for join")
+
+    # Wait for all to join — desired is current + launched (in case some failed)
+    expected = current + launched
+    if wait_for_node_ready(expected):
+        update_machineset_status(expected)
+        logging.info(f"==> scale_up complete: {expected} workers ready")
+    else:
+        logging.error(f"==> scale_up timed out: only some workers joined")
+        update_machineset_status(get_worker_count())
 
 # ── Scale down ────────────────────────────────────────────────────────────────
 def scale_down(desired):
-    last_worker = drain_last_worker()
+    """Drain and terminate workers one at a time until current matches desired."""
+    current = get_worker_count()
+    to_remove = current - desired
+    logging.info(f"==> scale_down: removing {to_remove} workers ({current} → {desired})")
 
-    if last_worker:
+    removed = 0
+    for i in range(to_remove):
+        last_worker = drain_last_worker()
+        if not last_worker:
+            logging.warning("  no workers left to remove")
+            break
+
         ip          = get_node_ip(last_worker)
         instance_id = get_instance_id_by_ip(ip)
 
-        # get attached volumes before terminating
-        vol_result = run(
-            f"aws ec2 describe-instances --instance-id {instance_id} "
-            f"--query 'Reservations[0].Instances[0].BlockDeviceMappings[*].Ebs.VolumeId' "
-            f"--region {REGION} --output text"
-        )
-        vol_ids = vol_result.stdout.strip().split()
+        if instance_id and instance_id != 'None':
+            # Root volume has DeleteOnTermination=true — AWS cleans it up
+            run(
+                f"aws ec2 terminate-instances "
+                f"--instance-ids {instance_id} "
+                f"--region {REGION}"
+            )
+            logging.info(f"  Terminated {instance_id} ({last_worker})")
+            run(f"aws ec2 wait instance-terminated --instance-ids {instance_id} --region {REGION}")
+        else:
+            logging.warning(f"  Could not find EC2 for {last_worker} — proceeding to delete Node only")
 
-        # terminate instance
-        run(
-            f"aws ec2 terminate-instances "
-            f"--instance-ids {instance_id} "
-            f"--region {REGION}"
-        )
-        logging.info(f"Terminated {instance_id}")
-
-        # wait for termination then delete volumes
-        run(f"aws ec2 wait instance-terminated --instance-ids {instance_id} --region {REGION}")
-        for vol in vol_ids:
-            run(f"aws ec2 delete-volume --volume-id {vol} --region {REGION}")
-            logging.info(f"Deleted volume {vol}")
-
-        # remove node from cluster
+        # Remove node object from cluster
         run(f"oc delete node {last_worker} --kubeconfig {KUBECONFIG}")
+        removed += 1
+        logging.info(f"  Removed {last_worker} ({removed}/{to_remove})")
 
-    # update both spec and status — node is already gone so immediate
-    update_machineset_replicas(desired)
-    update_machineset_status(desired)
-    logging.info(f"==> Scale down complete, MachineSet fully updated to {desired}")
+    final = current - removed
+    update_machineset_replicas(final)
+    update_machineset_status(final)
+    logging.info(f"==> scale_down complete: removed {removed} workers, now at {final}")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
@@ -265,15 +297,16 @@ def health():
 
 @app.route('/scale', methods=['POST'])
 def handle_scale():
-    data    = request.json
+    data    = request.json or {}
     desired = data.get('desired')
-    current = get_worker_count()
-
-    logging.info(f"Scale request: desired={desired} current={current}")
 
     if desired is None:
         return jsonify({"error": "desired count required"}), 400
 
+    current = get_worker_count()
+    logging.info(f"Scale request: desired={desired} current={current}")
+
+    # Clamp to bounds
     desired = max(MIN_WORKERS, min(MAX_WORKERS, desired))
 
     if desired > current:
@@ -285,7 +318,8 @@ def handle_scale():
     else:
         logging.info("No scaling needed")
 
-    return jsonify({"status": "ok", "desired": desired, "previous": current})
+    final = get_worker_count()
+    return jsonify({"status": "ok", "desired": desired, "previous": current, "current": final})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)

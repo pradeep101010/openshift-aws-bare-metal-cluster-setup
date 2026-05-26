@@ -254,8 +254,14 @@ curl -sf "$REPO_URL/autoscaler/watcher.py"             -o $WEB_ROOT/autoscaler/w
 curl -sf "$REPO_URL/autoscaler/requirements.txt"       -o $WEB_ROOT/autoscaler/requirements.txt
 curl -sf "$REPO_URL/autoscaler/ocp-autoscaler.service" -o $WEB_ROOT/autoscaler/ocp-autoscaler.service
 
+# Ignition stub template — used by webhook.py to generate user-data for new RHCOS workers
+curl -sf "$REPO_URL/terraform/scripts/ignition-stub.json.tpl" \
+  -o $WEB_ROOT/scripts/ignition-stub.json.tpl
+
+# Kubeconfig for the autoscaler EC2 to talk to the cluster
 cp $INSTALL_DIR/auth/kubeconfig $WEB_ROOT/auth/kubeconfig
 chmod 644 $WEB_ROOT/auth/kubeconfig
+
 chown -R www-data:www-data $WEB_ROOT/autoscaler $WEB_ROOT/auth
 
 

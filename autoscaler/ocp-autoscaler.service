@@ -9,10 +9,10 @@ WorkingDirectory=/opt/autoscaler
 Environment=KUBECONFIG=/opt/autoscaler/kubeconfig
 Environment=CLUSTER_NAME=__CLUSTER_NAME__
 Environment=BASTION_IP=__BASTION_IP__
-Environment=BOOTSTRAP_IP=__BOOTSTRAP_IP__
-Environment=BASE_DOMAIN=__BASE_DOMAIN__
-Environment=UBUNTU_AMI=__UBUNTU_AMI__
-Environment=NODE_INSTANCE_TYPE=m5.metal
+Environment=RHCOS_AMI=__RHCOS_AMI__
+Environment=KEY_PAIR_NAME=__KEY_PAIR_NAME__
+Environment=RHCOS_DISK_SIZE_GB=__RHCOS_DISK_SIZE_GB__
+Environment=NODE_INSTANCE_TYPE=__NODE_INSTANCE_TYPE__
 Environment=SUBNET_ID=__SUBNET_ID__
 Environment=NODE_SG_ID=__NODE_SG_ID__
 Environment=IAM_PROFILE=__IAM_PROFILE__

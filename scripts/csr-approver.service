@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=ubuntu
 Environment=KUBECONFIG=/home/ubuntu/ocp-install/auth/kubeconfig
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/bin/bash -c 'while true; do PENDING=$(oc get csr 2>/dev/null | grep Pending | awk "{print \$1}" || true); [ -n "$PENDING" ] && echo "$(date) Approving: $PENDING" && echo "$PENDING" | xargs oc adm certificate approve; sleep 30; done'
 StandardOutput=append:/var/log/csr-approver.log
 StandardError=append:/var/log/csr-approver.log

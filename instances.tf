@@ -99,11 +99,12 @@ resource "aws_instance" "autoscaler" {
     delete_on_termination = true
   }
 
-  user_data = base64encode(templatefile("${path.module}/scripts/autoscaler-init.sh.tpl", {
-    bastion_ip   = local.bastion_ip
-    cluster_name = var.cluster_name
-    base_domain  = var.base_domain
-    bootstrap_ip = local.bootstrap_ip
+user_data = base64encode(templatefile("${path.module}/scripts/autoscaler-init.sh.tpl", {
+    bastion_ip          = local.bastion_ip
+    cluster_name        = var.cluster_name
+    node_instance_type  = var.node_instance_type
+    key_pair_name       = aws_key_pair.ocp.key_name
+    rhcos_disk_size_gb  = var.rhcos_disk_size_gb
   }))
 
   depends_on = [aws_instance.bastion]
