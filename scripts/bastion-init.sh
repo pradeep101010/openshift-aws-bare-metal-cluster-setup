@@ -215,18 +215,18 @@ systemctl restart dnsmasq
 
 echo "==> DNS flipped to round-robin across masters"
 
-# ── 13. Approve worker CSRs ───────────────────────────────────────────────────
-for round in 1 2; do
-  sleep 60
-  PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
-  [ -n "$PENDING" ] && echo "$PENDING" | xargs oc adm certificate approve
-done
+# ── 19. Permanent CSR approval service ────────────────────────────────────────
+curl -sf "$REPO_URL/scripts/csr-approver.service" \
+  -o /etc/systemd/system/csr-approver.service
 
-until [ "$(oc get nodes --no-headers 2>/dev/null | grep -c Ready)" = "$EXPECTED_NODES" ]; do
-  PENDING=$(oc get csr 2>/dev/null | grep Pending | awk '{print $1}' || true)
-  [ -n "$PENDING" ] && echo "$PENDING" | xargs oc adm certificate approve
-  sleep 15
-done
+touch /var/log/csr-approver.log
+chown ubuntu:ubuntu /var/log/csr-approver.log
+
+systemctl daemon-reload
+systemctl enable --now csr-approver.service
+
+echo "==> CSR approver service started"
+echo "==> Cluster ready"
 
 # ── 14. Wait until cluster is usable (non-blocking install-complete) ─────────
 export KUBECONFIG=$INSTALL_DIR/auth/kubeconfig
@@ -324,20 +324,6 @@ cp $INSTALL_DIR/auth/kubeconfig $WEB_ROOT/auth/kubeconfig
 chmod 644 $WEB_ROOT/auth/kubeconfig
 
 chown -R www-data:www-data $WEB_ROOT/autoscaler $WEB_ROOT/auth
-
-
-# ── 19. Permanent CSR approval service ────────────────────────────────────────
-curl -sf "$REPO_URL/scripts/csr-approver.service" \
-  -o /etc/systemd/system/csr-approver.service
-
-touch /var/log/csr-approver.log
-chown ubuntu:ubuntu /var/log/csr-approver.log
-
-systemctl daemon-reload
-systemctl enable --now csr-approver.service
-
-echo "==> CSR approver service started"
-echo "==> Cluster ready"
 
 #-- 20. Make bastian reconstruct DNS records for node ingress traffic for new nodes-
 cat > /usr/local/bin/refresh-apps-dns.sh << 'EOF'
