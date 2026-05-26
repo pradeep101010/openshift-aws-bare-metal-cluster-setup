@@ -215,7 +215,7 @@ systemctl restart dnsmasq
 
 echo "==> DNS flipped to round-robin across masters"
 
-# ── 19. Permanent CSR approval service ────────────────────────────────────────
+# ── 13. Permanent CSR approval service ────────────────────────────────────────
 curl -sf "$REPO_URL/scripts/csr-approver.service" \
   -o /etc/systemd/system/csr-approver.service
 
@@ -325,7 +325,7 @@ chmod 644 $WEB_ROOT/auth/kubeconfig
 
 chown -R www-data:www-data $WEB_ROOT/autoscaler $WEB_ROOT/auth
 
-#-- 20. Make bastian reconstruct DNS records for node ingress traffic for new nodes-
+#-- 19. Make bastian reconstruct DNS records for node ingress traffic for new nodes-
 cat > /usr/local/bin/refresh-apps-dns.sh << 'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -371,7 +371,7 @@ sudo chmod +x /usr/local/bin/refresh-apps-dns.sh
 sudo touch /var/log/refresh-apps-dns.log
 sudo chown ubuntu:ubuntu /var/log/refresh-apps-dns.log
 
-#-- 21. Expose it as HTTP endpoint so webhook.py can call it after scaling events --
+#-- 20. Expose it as HTTP endpoint so webhook.py can call it after scaling events --
 sudo mkdir -p /var/www/cgi-bin
 
 sudo tee /var/www/cgi-bin/refresh-dns.sh > /dev/null <<'EOF'
@@ -388,7 +388,7 @@ CLUSTER_DOMAIN=$(cat /etc/dnsmasq.conf | grep -oP 'api\.\K[^/]+' | head -1)
 EOF
 
 sudo chmod +x /var/www/cgi-bin/refresh-dns.sh
-#-- 22. configure apache to enable CGI script--
+#-- 21. configure apache to enable CGI script--
 sudo a2enmod cgi 2>/dev/null || true
 
 # Make sure /cgi-bin/ is mapped to /var/www/cgi-bin/
