@@ -197,9 +197,38 @@ until [ "$(oc get nodes --no-headers 2>/dev/null | grep -c Ready)" = "$EXPECTED_
   sleep 15
 done
 
-# ── 14. Wait for install-complete ─────────────────────────────────────────────
-sudo -u ubuntu openshift-install wait-for install-complete \
-  --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log
+# ── 14. Wait until cluster is usable (non-blocking install-complete) ─────────
+export KUBECONFIG=$INSTALL_DIR/auth/kubeconfig
+
+echo "==> Waiting for OpenShift API..." | tee -a /var/log/bastion-init.log
+until oc whoami >/dev/null 2>&1; do
+  echo "  API not ready yet..." | tee -a /var/log/bastion-init.log
+  sleep 10
+done
+
+echo "==> API is reachable" | tee -a /var/log/bastion-init.log
+
+echo "==> Waiting for control plane nodes..." | tee -a /var/log/bastion-init.log
+until [ "$(oc get nodes --no-headers 2>/dev/null | grep -c ' Ready')" -ge 3 ]; do
+  oc get nodes 2>/dev/null | tee -a /var/log/bastion-init.log || true
+  sleep 15
+done
+
+echo "==> Control plane nodes are Ready" | tee -a /var/log/bastion-init.log
+
+echo "==> Waiting for ingress deployment..." | tee -a /var/log/bastion-init.log
+until oc -n openshift-ingress get deploy/router-default >/dev/null 2>&1; do
+  sleep 10
+done
+
+echo "==> Cluster is usable — continuing automation" | tee -a /var/log/bastion-init.log
+
+# Run install-complete in background only for monitoring/logging
+nohup sudo -u ubuntu openshift-install wait-for install-complete \
+  --dir=$INSTALL_DIR --log-level=info \
+  >> /var/log/install-complete.log 2>&1 &
+
+echo "==> Background install-complete watcher started" | tee -a /var/log/bastion-init.log
 
 # ── 15. Patch mastersSchedulable: false and reschedule routers ────────────────
 # Masters were schedulable during install (compute.replicas=0). Now that real
