@@ -131,7 +131,7 @@ IAM_PROFILE="$CLUSTER_NAME-node-profile"
 
 # Fail loudly if any required value couldn't be resolved
 for v in RHCOS_AMI SUBNET_ID NODE_SG_ID; do
-  if [ -z "${!v}" ] || [ "${!v}" = "None" ]; then
+  if [ -z "$${!v}" ] || [ "$${!v}" = "None" ]; then
     echo "FATAL: $v is empty — check AWS tags / RHCOS AMI availability in $REGION"
     exit 1
   fi
