@@ -277,3 +277,92 @@ systemctl enable --now csr-approver.service
 
 echo "==> CSR approver service started"
 echo "==> Cluster ready"
+
+#-- 20. Make bastian reconstruct DNS records for node ingress traffic for new nodes-
+cat > /usr/local/bin/refresh-apps-dns.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+exec >> /var/log/refresh-apps-dns.log 2>&1
+
+CONF=/etc/dnsmasq.conf
+CLUSTER_DOMAIN=${1:?usage: $0 <cluster-domain>}
+KUBECONFIG=/home/ubuntu/ocp-install/auth/kubeconfig
+export KUBECONFIG
+
+WORKER_IPS=$(oc get nodes \
+  -l 'node-role.kubernetes.io/worker,!node-role.kubernetes.io/master' \
+  -o jsonpath='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+  2>/dev/null | sort -u)
+
+if [ -z "$WORKER_IPS" ]; then
+  echo "$(date) FATAL: no worker IPs found — leaving dnsmasq unchanged"
+  exit 1
+fi
+
+echo "$(date) Refreshing *.apps DNS for workers:"
+echo "$WORKER_IPS" | sed 's/^/  /'
+
+sed -i "\|address=/.apps.$CLUSTER_DOMAIN/|d" $CONF
+
+NEW_BLOCK=""
+for ip in $WORKER_IPS; do
+  NEW_BLOCK="${NEW_BLOCK}address=/.apps.$CLUSTER_DOMAIN/$ip"$'\n'
+done
+
+if grep -q "etcd-0.$CLUSTER_DOMAIN" $CONF; then
+  awk -v block="$NEW_BLOCK" '/etcd-0/ && !done {print block; done=1} 1' $CONF > $CONF.new
+  mv $CONF.new $CONF
+else
+  echo "$NEW_BLOCK" >> $CONF
+fi
+
+systemctl restart dnsmasq
+echo "$(date) dnsmasq restarted"
+EOF
+
+sudo chmod +x /usr/local/bin/refresh-apps-dns.sh
+sudo touch /var/log/refresh-apps-dns.log
+sudo chown ubuntu:ubuntu /var/log/refresh-apps-dns.log
+
+#-- 21. Expose it as HTTP endpoint so webhook.py can call it after scaling events --
+sudo mkdir -p /var/www/cgi-bin
+
+sudo tee /var/www/cgi-bin/refresh-dns.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "Content-type: text/plain"
+echo ""
+
+# Lock so concurrent calls don't trample each other
+exec 200>/var/run/refresh-dns.lock
+flock -n 200 || { echo "another refresh in progress"; exit 0; }
+
+CLUSTER_DOMAIN=$(cat /etc/dnsmasq.conf | grep -oP 'api\.\K[^/]+' | head -1)
+/usr/local/bin/refresh-apps-dns.sh "$CLUSTER_DOMAIN" 2>&1
+EOF
+
+sudo chmod +x /var/www/cgi-bin/refresh-dns.sh
+#-- 22. configure apache to enable CGI script--
+sudo a2enmod cgi 2>/dev/null || true
+
+# Make sure /cgi-bin/ is mapped to /var/www/cgi-bin/
+# Check existing config:
+grep -r "cgi-bin" /etc/apache2/ | head
+
+# If not configured, add to /etc/apache2/conf-enabled/ocp.conf or similar:
+sudo tee /etc/apache2/conf-available/cgi.conf > /dev/null <<'EOF'
+ScriptAlias /cgi-bin/ /var/www/cgi-bin/
+<Directory /var/www/cgi-bin>
+    AllowOverride None
+    Options +ExecCGI
+    Require all granted
+</Directory>
+EOF
+
+sudo a2enconf cgi
+sudo systemctl reload apache2
+# Apache needs to run CGI as root
+sudo tee /etc/sudoers.d/dns-refresh > /dev/null <<'EOF'
+www-data ALL=(root) NOPASSWD: /usr/local/bin/refresh-apps-dns.sh, /usr/bin/systemctl restart dnsmasq
+EOF
+sudo chmod 440 /etc/sudoers.d/dns-refresh
+sudo sed -i 's|/usr/local/bin/refresh-apps-dns.sh|sudo /usr/local/bin/refresh-apps-dns.sh|' /var/www/cgi-bin/refresh-dns.sh

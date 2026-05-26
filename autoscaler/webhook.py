@@ -26,6 +26,8 @@ MIN_WORKERS         = int(os.environ.get('MIN_WORKERS',     '2'))
 MAX_WORKERS         = int(os.environ.get('MAX_WORKERS',     '10'))
 BASE_WORKER_IP      = os.environ.get('BASE_WORKER_IP',      '10.0.1')
 BASE_WORKER_OFFSET  = int(os.environ.get('BASE_WORKER_OFFSET', '24'))
+BASTION_DNS_REFRESH_URL = os.environ.get('BASTION_DNS_REFRESH_URL', f'http://{BASTION_IP}/cgi-bin/refresh-dns.sh')
+
 
 STUB_TEMPLATE_PATH  = '/opt/autoscaler/scripts/ignition-stub.json.tpl'
 
@@ -51,6 +53,14 @@ def get_worker_count():
         return int(result.stdout.strip())
     except:
         return 0
+
+def refresh_bastion_dns():
+    try:
+        import urllib.request
+        with urllib.request.urlopen(BASTION_DNS_REFRESH_URL, timeout=30) as resp:
+            logging.info(f"Bastion DNS refresh: {resp.read().decode()[:500]}")
+    except Exception as e:
+        logging.error(f"Bastion DNS refresh failed: {e}")
 
 def get_node_ip(node_name):
     result = run(
@@ -245,11 +255,13 @@ def scale_up(desired):
     # Wait for all to join — desired is current + launched (in case some failed)
     expected = current + launched
     if wait_for_node_ready(expected):
+        refresh_bastion_dns() 
         update_machineset_status(expected)
         logging.info(f"==> scale_up complete: {expected} workers ready")
     else:
         logging.error(f"==> scale_up timed out: only some workers joined")
         update_machineset_status(get_worker_count())
+    
 
 # ── Scale down ────────────────────────────────────────────────────────────────
 def scale_down(desired):
@@ -288,6 +300,7 @@ def scale_down(desired):
     final = current - removed
     update_machineset_replicas(final)
     update_machineset_status(final)
+    refresh_bastion_dns() 
     logging.info(f"==> scale_down complete: removed {removed} workers, now at {final}")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
