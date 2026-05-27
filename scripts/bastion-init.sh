@@ -21,6 +21,7 @@ REGION=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
 CLUSTER_DOMAIN="$CLUSTER_NAME.$BASE_DOMAIN"
 WEB_ROOT="/var/www/html"
 INSTALL_DIR="/home/ubuntu/ocp-install"
+REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main"
 
 WORKER_COUNT=$(echo $WORKER_IPS | wc -w)
 EXPECTED_NODES=$((3 + WORKER_COUNT))
@@ -298,7 +299,7 @@ BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
 aws ec2 terminate-instances --instance-ids "$BOOTSTRAP_INSTANCE" --region "$REGION"
 
 # ── 17. Apply autoscaler manifests ────────────────────────────────────────────
-REPO_URL="https://raw.githubusercontent.com/pradeep101010/openshift-aws-bare-metal-cluster-setup/main"
+
 
 curl -sf "$REPO_URL/autoscaler/manifests/machineset.yaml" \
   | sed "s/__CLUSTER_NAME__/$CLUSTER_NAME/g; s/__WORKER_COUNT__/$WORKER_COUNT/g" \
