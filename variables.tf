@@ -71,10 +71,15 @@ variable "bastion_instance_type" {
   default     = "m5.xlarge"
 }
 
-variable "node_instance_type" {
+variable "master_instance_type" {
+  description = "OCP master instance type. Must be bare metal."
+  type        = string
+  default = "m5.xlarge"
+}
+variable "worker_instance_type" {
   description = "OCP node instance type. Must be bare metal."
   type        = string
-  default     = "m5.xlarge"
+  default     = "t3.medium"
 }
 
 variable "vpc_cidr" {

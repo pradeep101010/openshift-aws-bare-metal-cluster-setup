@@ -102,7 +102,7 @@ resource "aws_instance" "autoscaler" {
 user_data = base64encode(templatefile("${path.module}/scripts/autoscaler-init.sh.tpl", {
     bastion_ip          = local.bastion_ip
     cluster_name        = var.cluster_name
-    node_instance_type  = var.node_instance_type
+    node_instance_type  = var.worker_instance_type
     key_pair_name       = aws_key_pair.ocp.key_name
     rhcos_disk_size_gb  = var.rhcos_disk_size_gb
   }))
@@ -116,7 +116,7 @@ resource "aws_instance" "ocp_node" {
   for_each = local.fixed_nodes
 
   ami                         = data.aws_ami.rhcos.id
-  instance_type               = var.node_instance_type
+  instance_type               = var.master_instance_type
   availability_zone           = var.availability_zone
   subnet_id                   = aws_subnet.ocp.id
   key_name                    = aws_key_pair.ocp.key_name
@@ -183,7 +183,7 @@ resource "aws_instance" "worker" {
   for_each = local.worker_nodes
 
   ami                         = data.aws_ami.rhcos.id
-  instance_type               = var.node_instance_type
+  instance_type               = var.worker_instance_type
   availability_zone           = var.availability_zone
   subnet_id                   = aws_subnet.ocp.id
   key_name                    = aws_key_pair.ocp.key_name
