@@ -68,13 +68,13 @@ variable "key_pair_name" {
 variable "bastion_instance_type" {
   description = "Bastion instance type"
   type        = string
-  default     = "t3.medium"
+  default     = "m5.xlarge"
 }
 
 variable "node_instance_type" {
   description = "OCP node instance type. Must be bare metal."
   type        = string
-  default     = "t3.medium"
+  default     = "m5.xlarge"
 }
 
 variable "vpc_cidr" {
