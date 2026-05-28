@@ -307,8 +307,6 @@ BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
 aws ec2 terminate-instances --instance-ids "$BOOTSTRAP_INSTANCE" --region "$REGION"
 
 # ── 17. Apply autoscaler manifests ────────────────────────────────────────────
-
-
 curl -sf "$REPO_URL/autoscaler/manifests/machineset.yaml" \
   | sed "s/__CLUSTER_NAME__/$CLUSTER_NAME/g; s/__WORKER_COUNT__/$WORKER_COUNT/g" \
   | oc apply -f -
@@ -362,7 +360,8 @@ fi
 echo "$(date) Refreshing *.apps DNS for workers:"
 echo "$WORKER_IPS" | sed 's/^/  /'
 
-sed -i "\|address=/.apps.$CLUSTER_DOMAIN/|d" $CONF
+ESCAPED_DOMAIN=$(printf '%s\n' "$CLUSTER_DOMAIN" | sed 's/[.[\*^$()+?{|]/\\&/g')
+sed -i "\|address=/\.apps\.${ESCAPED_DOMAIN}/|d" "$CONF"
 
 NEW_BLOCK=""
 for ip in $WORKER_IPS; do
@@ -396,33 +395,37 @@ echo ""
 exec 200>/var/run/refresh-dns.lock
 flock -n 200 || { echo "another refresh in progress"; exit 0; }
 
-CLUSTER_DOMAIN=$(cat /etc/dnsmasq.conf | grep -oP 'api\.\K[^/]+' | head -1)
+CLUSTER_DOMAIN=$(grep -oP 'address=/api\.\K[^/]+' /etc/dnsmasq.conf | head -1)
 /usr/local/bin/refresh-apps-dns.sh "$CLUSTER_DOMAIN" 2>&1
 EOF
 
 sudo chmod +x /var/www/cgi-bin/refresh-dns.sh
-#-- 21. configure apache to enable CGI script--
-sudo a2enmod cgi 2>/dev/null || true
+#-- 21. Configure Apache CGI support ------------------------------------------
 
-# Make sure /cgi-bin/ is mapped to /var/www/cgi-bin/
-# Check existing config:
-grep -r "cgi-bin" /etc/apache2/ | head
+sudo mkdir -p /var/www/cgi-bin
 
-# If not configured, add to /etc/apache2/conf-enabled/ocp.conf or similar:
 sudo tee /etc/apache2/conf-available/cgi.conf > /dev/null <<'EOF'
 ScriptAlias /cgi-bin/ /var/www/cgi-bin/
-<Directory /var/www/cgi-bin>
+
+<Directory "/var/www/cgi-bin">
     AllowOverride None
     Options +ExecCGI
     Require all granted
 </Directory>
 EOF
 
-sudo a2enconf cgi
-sudo systemctl reload apache2
-# Apache needs to run CGI as root
-sudo tee /etc/sudoers.d/dns-refresh > /dev/null <<'EOF'
-www-data ALL=(root) NOPASSWD: /usr/local/bin/refresh-apps-dns.sh, /usr/bin/systemctl restart dnsmasq
-EOF
-sudo chmod 440 /etc/sudoers.d/dns-refresh
-sudo sed -i 's|/usr/local/bin/refresh-apps-dns.sh|sudo /usr/local/bin/refresh-apps-dns.sh|' /var/www/cgi-bin/refresh-dns.sh
+# Enable CGI module (Ubuntu may auto-select cgid)
+sudo a2enmod cgid >/dev/null 2>&1 || sudo a2enmod cgi >/dev/null 2>&1 || true
+
+# Enable config
+sudo a2enconf cgi >/dev/null 2>&1 || true
+
+# REQUIRED after enabling modules
+sudo systemctl restart apache2
+
+# Verify Apache came back
+sudo systemctl is-active --quiet apache2 || {
+    echo "ERROR: apache2 failed to start"
+    sudo journalctl -u apache2 --no-pager -n 50
+    exit 1
+}

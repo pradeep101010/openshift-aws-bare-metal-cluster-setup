@@ -2,6 +2,9 @@
 import subprocess, logging, os, time, tempfile
 from flask import Flask, request, jsonify
 from kubernetes import client, config
+import threading
+
+scale_lock = threading.Lock()
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -176,6 +179,31 @@ def drain_last_worker():
     )
     return last_worker
 
+def sync_router_replicas():
+    worker_count = get_worker_count()
+    run(
+        f"oc patch ingresscontroller default -n openshift-ingress-operator "
+        f"--type=merge -p '{{\"spec\":{{\"replicas\":{worker_count}}}}}' "
+        f"--kubeconfig {KUBECONFIG}"
+    )
+    logging.info(f"IngressController replicas set to {worker_count}")
+
+def wait_for_routers_ready(timeout=300):
+    start = time.time()
+    while time.time() - start < timeout:
+        result = run(
+            f"oc get deploy router-default -n openshift-ingress "
+            f"-o jsonpath='{{.status.availableReplicas}}/{{.spec.replicas}}' "
+            f"--kubeconfig {KUBECONFIG}"
+        )
+        avail, _, want = result.stdout.strip().partition('/')
+        if avail and want and avail == want and int(want) > 0:
+            logging.info(f"==> routers ready: {avail}/{want}")
+            return True
+        time.sleep(10)
+    logging.warning("routers did not all become ready in time")
+    return False
+
 # ── Provision one worker (called by scale_up loop) ────────────────────────────
 def provision_one_worker():
     """Launch a single RHCOS worker. Returns the new IP on success, None on failure."""
@@ -255,6 +283,8 @@ def scale_up(desired):
     # Wait for all to join — desired is current + launched (in case some failed)
     expected = current + launched
     if wait_for_node_ready(expected):
+        sync_router_replicas() 
+        wait_for_routers_ready() 
         refresh_bastion_dns() 
         update_machineset_status(expected)
         logging.info(f"==> scale_up complete: {expected} workers ready")
@@ -300,6 +330,8 @@ def scale_down(desired):
     final = current - removed
     update_machineset_replicas(final)
     update_machineset_status(final)
+    sync_router_replicas() 
+    wait_for_routers_ready() 
     refresh_bastion_dns() 
     logging.info(f"==> scale_down complete: removed {removed} workers, now at {final}")
 
@@ -312,27 +344,32 @@ def health():
 def handle_scale():
     data    = request.json or {}
     desired = data.get('desired')
-
     if desired is None:
         return jsonify({"error": "desired count required"}), 400
 
-    current = get_worker_count()
-    logging.info(f"Scale request: desired={desired} current={current}")
+    # Only one scale operation at a time. If another is running, reject fast.
+    if not scale_lock.acquire(blocking=False):
+        logging.warning("Scale already in progress — rejecting concurrent request")
+        return jsonify({"status": "busy", "message": "scale operation in progress"}), 409
 
-    # Clamp to bounds
-    desired = max(MIN_WORKERS, min(MAX_WORKERS, desired))
+    try:
+        current = get_worker_count()
+        logging.info(f"Scale request: desired={desired} current={current}")
+        desired = max(MIN_WORKERS, min(MAX_WORKERS, desired))
 
-    if desired > current:
-        logging.info(f"Scaling UP {current} → {desired}")
-        scale_up(desired)
-    elif desired < current:
-        logging.info(f"Scaling DOWN {current} → {desired}")
-        scale_down(desired)
-    else:
-        logging.info("No scaling needed")
+        if desired > current:
+            logging.info(f"Scaling UP {current} → {desired}")
+            scale_up(desired)
+        elif desired < current:
+            logging.info(f"Scaling DOWN {current} → {desired}")
+            scale_down(desired)
+        else:
+            logging.info("No scaling needed")
 
-    final = get_worker_count()
-    return jsonify({"status": "ok", "desired": desired, "previous": current, "current": final})
+        final = get_worker_count()
+        return jsonify({"status": "ok", "desired": desired, "previous": current, "current": final})
+    finally:
+        scale_lock.release()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)

@@ -68,7 +68,7 @@ variable "key_pair_name" {
 variable "bastion_instance_type" {
   description = "Bastion instance type"
   type        = string
-  default     = "m5.xlarge"
+  default     = "t3.medium"
 }
 
 variable "master_instance_type" {
