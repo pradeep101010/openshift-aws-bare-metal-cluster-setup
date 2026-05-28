@@ -22,7 +22,7 @@ pull_secret = <<-EOT
 EOT
 # Instance types
 bastion_instance_type = "t3.medium"   # Needs ~30 GB free for RHCOS image
-node_instance_type    = "m5.metal"    # Must be bare metal
+node_instance_type    = "t3.medium"    # Must be bare metal
 
 # Disk
 rhcos_disk_size_gb = 130

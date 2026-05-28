@@ -74,7 +74,7 @@ variable "bastion_instance_type" {
 variable "node_instance_type" {
   description = "OCP node instance type. Must be bare metal."
   type        = string
-  default     = "m5.metal"
+  default     = "t3.medium"
 }
 
 variable "vpc_cidr" {

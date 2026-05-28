@@ -277,15 +277,23 @@ oc -n openshift-ingress delete pod --all
 # Wait for all router pods to come back Running
 echo "==> Waiting for routers to be Running..."
 for i in $(seq 1 30); do
-  TOTAL=$(oc -n openshift-ingress get pods --no-headers 2>/dev/null | wc -l)
-  RUNNING=$(oc -n openshift-ingress get pods --no-headers 2>/dev/null | grep -c Running || echo 0)
-  if [ "$RUNNING" -ge "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
-    echo "==> All $TOTAL router pods Running"
+  DESIRED=$(oc -n openshift-ingress get deploy router-default \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null)
+  AVAILABLE=$(oc -n openshift-ingress get deploy router-default \
+    -o jsonpath='{.status.availableReplicas}' 2>/dev/null)
+  DESIRED=${DESIRED:-0}
+  AVAILABLE=${AVAILABLE:-0}
+
+  if [ "$AVAILABLE" -ge "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
+    echo "==> All $AVAILABLE/$DESIRED router replicas Running"
     break
   fi
-  echo "  attempt $i/30 — $RUNNING/$TOTAL routers Running"
+  echo "  attempt $i/30 — $AVAILABLE/$DESIRED router replicas Running"
   sleep 10
 done
+
+sleep 30
+echo "==> Master/worker separation complete"
 
 # Let cluster operators (auth, console) recover after router move
 sleep 30
@@ -307,6 +315,10 @@ curl -sf "$REPO_URL/autoscaler/manifests/machineset.yaml" \
 curl -sf "$REPO_URL/autoscaler/manifests/cluster-autoscaler.yaml" | oc apply -f -
 curl -sf "$REPO_URL/autoscaler/manifests/machine-autoscaler.yaml" \
   | sed "s/__WORKER_COUNT__/$WORKER_COUNT/g" | oc apply -f -
+echo "==> Seeding MachineSet status to match initial worker count ($WORKER_COUNT)"
+oc patch machineset worker-autoscale -n openshift-machine-api \
+  --subresource=status --type=merge \
+  -p "{\"status\":{\"replicas\":$WORKER_COUNT,\"readyReplicas\":$WORKER_COUNT,\"availableReplicas\":$WORKER_COUNT}}"
 
 # ── 18. Publish autoscaler files ──────────────────────────────────────────────
 mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth $WEB_ROOT/scripts 
@@ -317,7 +329,7 @@ curl -sf "$REPO_URL/autoscaler/requirements.txt"       -o $WEB_ROOT/autoscaler/r
 curl -sf "$REPO_URL/autoscaler/ocp-autoscaler.service" -o $WEB_ROOT/autoscaler/ocp-autoscaler.service
 
 # Ignition stub template — used by webhook.py to generate user-data for new RHCOS workers
-curl -sf "$REPO_URL/terraform/scripts/ignition-stub.json.tpl" \
+curl -sf "$REPO_URL/scripts/ignition-stub.json.tpl"  \
   -o $WEB_ROOT/scripts/ignition-stub.json.tpl
 
 # Kubeconfig for the autoscaler EC2 to talk to the cluster
