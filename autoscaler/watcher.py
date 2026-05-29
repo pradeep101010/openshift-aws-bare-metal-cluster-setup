@@ -69,19 +69,14 @@ def get_worker_nodes():
     ]
 
 def get_unschedulable_pods():
-    """Pending pods that are unschedulable for reasons MORE NODES would fix.
-       Excludes DaemonSet pods, pods waiting on PVCs, and system pods that
-       scaling can't satisfy."""
     v1 = client.CoreV1Api()
     pods = v1.list_pod_for_all_namespaces(field_selector='status.phase=Pending').items
     out = []
     for p in pods:
-        # Skip DaemonSet pods — scaling adds more of them, never fewer pending
         owners = p.metadata.owner_references or []
         if any(o.kind == 'DaemonSet' for o in owners):
             continue
 
-        # Find the Unschedulable condition and inspect WHY
         sched_cond = next(
             (c for c in (p.status.conditions or [])
              if c.type == 'PodScheduled' and c.status == 'False'),
@@ -92,17 +87,23 @@ def get_unschedulable_pods():
 
         msg = (sched_cond.message or '').lower()
 
-        # Skip pods blocked on storage — more nodes won't bind a PVC
+        # Skip storage-blocked pods (PVCs)
         if 'persistentvolume' in msg or 'pvc' in msg or 'volume node affinity' in msg:
             continue
 
-        # Skip pods blocked purely on taints the new nodes won't have
-        # (optional — only if you see false positives)
-        # if 'untolerated taint' in msg and 'insufficient' not in msg:
-        #     continue
+        # Skip pods with host-port conflicts (routers with hostNetwork)
+        if "didn't have free ports" in msg or 'free ports for the requested' in msg:
+            continue
 
-        # Only count pods that are pending due to INSUFFICIENT RESOURCES
-        # ("Insufficient cpu", "Insufficient memory") — that's what nodes fix
+        # Skip system namespaces — infrastructure capacity is sized by ops,
+        # not driven by autoscaler. Their churn (operator restarts, marketplace
+        # refresh, monitoring rollouts) creates transient Pending pods that
+        # shouldn't drive node scaling.
+        ns = p.metadata.namespace
+        if ns.startswith('openshift-') or ns == 'kube-system' or ns == 'default':
+            continue
+
+        # Only count if the unschedulable reason is genuinely insufficient resources
         if 'insufficient' in msg:
             out.append(p)
 
