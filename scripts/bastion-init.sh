@@ -278,11 +278,15 @@ oc -n openshift-ingress delete pod --all
 echo "==> Waiting for routers to be Running..."
 for i in $(seq 1 30); do
   DESIRED=$(oc -n openshift-ingress get deploy router-default \
-    -o jsonpath='{.spec.replicas}' 2>/dev/null)
+    -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
   AVAILABLE=$(oc -n openshift-ingress get deploy router-default \
-    -o jsonpath='{.status.availableReplicas}' 2>/dev/null)
+    -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo "0")
   DESIRED=${DESIRED:-0}
   AVAILABLE=${AVAILABLE:-0}
+
+  # Guard against empty/non-numeric values killing script under set -e
+  [[ "$DESIRED"   =~ ^[0-9]+$ ]] || DESIRED=0
+  [[ "$AVAILABLE" =~ ^[0-9]+$ ]] || AVAILABLE=0
 
   if [ "$AVAILABLE" -ge "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
     echo "==> All $AVAILABLE/$DESIRED router replicas Running"
