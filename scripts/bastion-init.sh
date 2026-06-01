@@ -303,6 +303,82 @@ echo "==> Master/worker separation complete"
 sleep 30
 echo "==> Master/worker separation complete"
 
+# ── 15b. Install HAProxy and configure as front-end LB ───────────────────────
+echo "==> Installing HAProxy"
+apt-get install -y -qq haproxy
+
+# Build initial server lines from WORKER_IPS env var
+HTTP_SERVERS=""
+HTTPS_SERVERS=""
+for ip in $WORKER_IPS; do
+  name="worker$(echo $ip | cut -d. -f4)"
+  HTTP_SERVERS="${HTTP_SERVERS}    server ${name} ${ip}:80  check inter 10s fall 2 rise 2\n"
+  HTTPS_SERVERS="${HTTPS_SERVERS}    server ${name} ${ip}:443 check inter 10s fall 2 rise 2\n"
+done
+
+cat > /etc/haproxy/haproxy.cfg << EOF
+global
+    log /dev/log local0
+    maxconn 50000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log     global
+    option  tcplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+
+frontend stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats admin if TRUE
+
+#-- apps_http
+frontend apps_http
+    bind *:80
+    mode tcp
+    default_backend workers_http
+
+backend workers_http
+    mode tcp
+    balance roundrobin
+    option tcp-check
+$(echo -e "$HTTP_SERVERS")
+#-- apps_https
+frontend apps_https
+    bind *:443
+    mode tcp
+    default_backend workers_https
+
+backend workers_https
+    mode tcp
+    balance roundrobin
+    option tcp-check
+$(echo -e "$HTTPS_SERVERS")
+#-- ocp_api
+frontend ocp_api
+    bind *:6443
+    mode tcp
+    default_backend masters_api
+
+backend masters_api
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server master21 $MASTER0_IP:6443 check inter 10s fall 2 rise 2
+    server master22 $MASTER1_IP:6443 check inter 10s fall 2 rise 2
+    server master23 $MASTER2_IP:6443 check inter 10s fall 2 rise 2
+EOF
+
+sudo systemctl enable haproxy && sudo systemctl restart haproxy
+echo "==> HAProxy configured with workers: $WORKER_IPS"
+
 # ── 16. Terminate bootstrap ───────────────────────────────────────────────────
 BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
   --filters "Name=private-ip-address,Values=$BOOTSTRAP_IP" \
@@ -340,67 +416,98 @@ chmod 644 $WEB_ROOT/auth/kubeconfig
 
 chown -R www-data:www-data $WEB_ROOT/autoscaler $WEB_ROOT/auth
 
-#-- 19. Make bastian reconstruct DNS records for node ingress traffic for new nodes-
-cat > /usr/local/bin/refresh-apps-dns.sh << 'EOF'
+# ── 19. Point *.apps permanently at bastion (HAProxy handles worker routing) ──
+# Remove existing worker round-robin entries — bastion IP is now the stable entry point
+sed -i "\|address=/\.apps\.$CLUSTER_DOMAIN/|d" /etc/dnsmasq.conf
+echo "address=/.apps.$CLUSTER_DOMAIN/$BASTION_IP" >> /etc/dnsmasq.conf
+systemctl restart dnsmasq
+echo "==> *.apps DNS now permanently points to bastion HAProxy"
+
+# refresh-apps-dns.sh is now replaced by refresh-haproxy.sh — keep the script
+# for reference but it no longer needs to update dnsmasq
+cat > /usr/local/bin/refresh-haproxy.sh << 'HAEOF'
 #!/bin/bash
 set -euo pipefail
-exec >> /var/log/refresh-apps-dns.log 2>&1
+exec >> /var/log/refresh-haproxy.log 2>&1
 
-CONF=/etc/dnsmasq.conf
-CLUSTER_DOMAIN=${1:?usage: $0 <cluster-domain>}
 KUBECONFIG=/home/ubuntu/ocp-install/auth/kubeconfig
 export KUBECONFIG
+CFG=/etc/haproxy/haproxy.cfg
+TMPFILE=$(mktemp)
 
+echo "$(date) Refreshing HAProxy worker backends..."
+
+# Get all ready worker IPs from cluster
 WORKER_IPS=$(oc get nodes \
   -l 'node-role.kubernetes.io/worker,!node-role.kubernetes.io/master' \
-  -o jsonpath='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
-  2>/dev/null | sort -u)
+  --no-headers 2>/dev/null | awk '$2=="Ready" {print $1}' | while read node; do
+    oc get node "$node" \
+      -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null
+    echo
+  done | sort -u)
 
 if [ -z "$WORKER_IPS" ]; then
-  echo "$(date) FATAL: no worker IPs found — leaving dnsmasq unchanged"
+  echo "$(date) FATAL: no ready worker IPs found — leaving HAProxy unchanged"
   exit 1
 fi
 
-echo "$(date) Refreshing *.apps DNS for workers:"
+echo "$(date) Workers found:"
 echo "$WORKER_IPS" | sed 's/^/  /'
 
-ESCAPED_DOMAIN=$(printf '%s\n' "$CLUSTER_DOMAIN" | sed 's/[.[\*^$()+?{|]/\\&/g')
-sed -i "\|address=/\.apps\.${ESCAPED_DOMAIN}/|d" "$CONF"
+# Build new server blocks
+HTTP_SERVERS=""
+HTTPS_SERVERS=""
+while IFS= read -r ip; do
+  [ -z "$ip" ] && continue
+  name="worker$(echo $ip | cut -d. -f4)"
+  HTTP_SERVERS="${HTTP_SERVERS}    server ${name} ${ip}:80  check inter 10s fall 2 rise 2\n"
+  HTTPS_SERVERS="${HTTPS_SERVERS}    server ${name} ${ip}:443 check inter 10s fall 2 rise 2\n"
+done <<< "$WORKER_IPS"
 
-NEW_BLOCK=""
-for ip in $WORKER_IPS; do
-  NEW_BLOCK="${NEW_BLOCK}address=/.apps.$CLUSTER_DOMAIN/$ip"$'\n'
-done
+# Rewrite server lines between backend markers
+awk -v http="$HTTP_SERVERS" -v https="$HTTPS_SERVERS" '
+  /^#-- apps_http/  { in_http=1;  in_https=0 }
+  /^#-- apps_https/ { in_https=1; in_http=0  }
+  /^#-- ocp_api/    { in_http=0;  in_https=0 }
+  /^    server / && in_http  { next }
+  /^    server / && in_https { next }
+  /^backend workers_http/  { print; next }
+  /^backend workers_https/ { print; next }
+  /^option tcp-check/ && in_http  { print; printf "%s", http;  next }
+  /^option tcp-check/ && in_https { print; printf "%s", https; next }
+  { print }
+' "$CFG" > "$TMPFILE"
 
-if grep -q "etcd-0.$CLUSTER_DOMAIN" $CONF; then
-  awk -v block="$NEW_BLOCK" '/etcd-0/ && !done {print block; done=1} 1' $CONF > $CONF.new
-  mv $CONF.new $CONF
+# Validate HAProxy config before applying
+if haproxy -c -f "$TMPFILE" >/dev/null 2>&1; then
+  cp "$TMPFILE" "$CFG"
+  systemctl reload haproxy
+  echo "$(date) HAProxy reloaded successfully"
 else
-  echo "$NEW_BLOCK" >> $CONF
+  echo "$(date) FATAL: HAProxy config validation failed — not applying"
+  haproxy -c -f "$TMPFILE"
+  rm -f "$TMPFILE"
+  exit 1
 fi
 
-systemctl restart dnsmasq
-echo "$(date) dnsmasq restarted"
-EOF
+rm -f "$TMPFILE"
+HAEOF
 
-sudo chmod +x /usr/local/bin/refresh-apps-dns.sh
-sudo touch /var/log/refresh-apps-dns.log
-sudo chown ubuntu:ubuntu /var/log/refresh-apps-dns.log
+chmod +x /usr/local/bin/refresh-haproxy.sh
+touch /var/log/refresh-haproxy.log
+chown ubuntu:ubuntu /var/log/refresh-haproxy.log
+echo "==> refresh-haproxy.sh installed"
 
-#-- 20. Expose it as HTTP endpoint so webhook.py can call it after scaling events --
-sudo mkdir -p /var/www/cgi-bin
-
+#-- 20. CGI endpoint for webhook.py to call after scaling ----------------------
 sudo tee /var/www/cgi-bin/refresh-dns.sh > /dev/null <<'EOF'
 #!/bin/bash
 echo "Content-type: text/plain"
 echo ""
 
-# Lock so concurrent calls don't trample each other
-exec 200>/var/run/refresh-dns.lock
+exec 200>/var/run/refresh-haproxy.lock
 flock -n 200 || { echo "another refresh in progress"; exit 0; }
 
-CLUSTER_DOMAIN=$(grep -oP 'address=/api\.\K[^/]+' /etc/dnsmasq.conf | head -1)
-/usr/local/bin/refresh-apps-dns.sh "$CLUSTER_DOMAIN" 2>&1
+/usr/local/bin/refresh-haproxy.sh 2>&1
 EOF
 
 sudo chmod +x /var/www/cgi-bin/refresh-dns.sh
