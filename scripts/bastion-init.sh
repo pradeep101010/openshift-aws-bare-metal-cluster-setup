@@ -175,6 +175,82 @@ chown -R ubuntu:ubuntu $INSTALL_DIR
 sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
 echo "==> bootstrap-complete reached"
+# ── 15b. Install HAProxy and configure as front-end LB ───────────────────────
+echo "==> Installing HAProxy"
+apt-get install -y -qq haproxy
+
+# Build initial server lines from WORKER_IPS env var
+HTTP_SERVERS=""
+HTTPS_SERVERS=""
+for ip in $WORKER_IPS; do
+  name="worker$(echo $ip | cut -d. -f4)"
+  HTTP_SERVERS="${HTTP_SERVERS}    server ${name} ${ip}:80  check inter 10s fall 2 rise 2\n"
+  HTTPS_SERVERS="${HTTPS_SERVERS}    server ${name} ${ip}:443 check inter 10s fall 2 rise 2\n"
+done
+
+cat > /etc/haproxy/haproxy.cfg << EOF
+global
+    log /dev/log local0
+    maxconn 50000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log     global
+    option  tcplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+
+frontend stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats admin if TRUE
+
+#-- apps_http
+frontend apps_http
+    bind *:80
+    mode tcp
+    default_backend workers_http
+
+backend workers_http
+    mode tcp
+    balance roundrobin
+    option tcp-check
+$(echo -e "$HTTP_SERVERS")
+#-- apps_https
+frontend apps_https
+    bind *:443
+    mode tcp
+    default_backend workers_https
+
+backend workers_https
+    mode tcp
+    balance roundrobin
+    option tcp-check
+$(echo -e "$HTTPS_SERVERS")
+#-- ocp_api
+frontend ocp_api
+    bind *:6443
+    mode tcp
+    default_backend masters_api
+
+backend masters_api
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server master21 $MASTER0_IP:6443 check inter 10s fall 2 rise 2
+    server master22 $MASTER1_IP:6443 check inter 10s fall 2 rise 2
+    server master23 $MASTER2_IP:6443 check inter 10s fall 2 rise 2
+EOF
+
+sudo systemctl enable haproxy && sudo systemctl restart haproxy
+echo "==> HAProxy configured with workers: $WORKER_IPS"
+
 
 # ── 12. Flip DNS bootstrap → bastion HAProxy ──────────────────────────────────
 # HAProxy on bastion handles load balancing across all 3 masters with health
@@ -293,81 +369,6 @@ echo "==> Master/worker separation complete"
 sleep 30
 echo "==> Master/worker separation complete"
 
-# ── 15b. Install HAProxy and configure as front-end LB ───────────────────────
-echo "==> Installing HAProxy"
-apt-get install -y -qq haproxy
-
-# Build initial server lines from WORKER_IPS env var
-HTTP_SERVERS=""
-HTTPS_SERVERS=""
-for ip in $WORKER_IPS; do
-  name="worker$(echo $ip | cut -d. -f4)"
-  HTTP_SERVERS="${HTTP_SERVERS}    server ${name} ${ip}:80  check inter 10s fall 2 rise 2\n"
-  HTTPS_SERVERS="${HTTPS_SERVERS}    server ${name} ${ip}:443 check inter 10s fall 2 rise 2\n"
-done
-
-cat > /etc/haproxy/haproxy.cfg << EOF
-global
-    log /dev/log local0
-    maxconn 50000
-    user haproxy
-    group haproxy
-    daemon
-
-defaults
-    log     global
-    option  tcplog
-    option  dontlognull
-    timeout connect 5s
-    timeout client  50s
-    timeout server  50s
-
-frontend stats
-    bind *:8404
-    stats enable
-    stats uri /stats
-    stats refresh 10s
-    stats admin if TRUE
-
-#-- apps_http
-frontend apps_http
-    bind *:80
-    mode tcp
-    default_backend workers_http
-
-backend workers_http
-    mode tcp
-    balance roundrobin
-    option tcp-check
-$(echo -e "$HTTP_SERVERS")
-#-- apps_https
-frontend apps_https
-    bind *:443
-    mode tcp
-    default_backend workers_https
-
-backend workers_https
-    mode tcp
-    balance roundrobin
-    option tcp-check
-$(echo -e "$HTTPS_SERVERS")
-#-- ocp_api
-frontend ocp_api
-    bind *:6443
-    mode tcp
-    default_backend masters_api
-
-backend masters_api
-    mode tcp
-    balance roundrobin
-    option tcp-check
-    server master21 $MASTER0_IP:6443 check inter 10s fall 2 rise 2
-    server master22 $MASTER1_IP:6443 check inter 10s fall 2 rise 2
-    server master23 $MASTER2_IP:6443 check inter 10s fall 2 rise 2
-EOF
-
-sudo systemctl enable haproxy && sudo systemctl restart haproxy
-echo "==> HAProxy configured with workers: $WORKER_IPS"
 
 # ── 16. Terminate bootstrap ───────────────────────────────────────────────────
 BOOTSTRAP_INSTANCE=$(aws ec2 describe-instances \
