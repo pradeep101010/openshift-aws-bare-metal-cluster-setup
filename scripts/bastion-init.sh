@@ -176,13 +176,9 @@ sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
 echo "==> bootstrap-complete reached"
 
-# ── 12. Flip DNS bootstrap → masters (round-robin across all 3) ───────────────
-# Was: single sed pin to MASTER0_IP. That's a single point of failure — if
-# master0 has any issue, the bastion (and anything resolving via it) loses
-# access to the cluster API entirely.
-#
-# Instead, write 3 address records for api and 3 for api-int — dnsmasq
-# round-robins among them. Surviving any one master failure is automatic.
+# ── 12. Flip DNS bootstrap → bastion HAProxy ──────────────────────────────────
+# HAProxy on bastion handles load balancing across all 3 masters with health
+# checks — better than dnsmasq round-robin which has no health checking.
 
 # Remove the old bootstrap-pinned entries
 sed -i "\|address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|d"     /etc/dnsmasq.conf
@@ -190,14 +186,8 @@ sed -i "\|address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP|d" /etc/dnsmasq.conf
 
 # Write 3 lines each for api and api-int
 cat >> /etc/dnsmasq.conf <<EOF
-
-# API endpoints — round-robin across all masters
-address=/api.$CLUSTER_DOMAIN/$MASTER0_IP
-address=/api.$CLUSTER_DOMAIN/$MASTER1_IP
-address=/api.$CLUSTER_DOMAIN/$MASTER2_IP
-address=/api-int.$CLUSTER_DOMAIN/$MASTER0_IP
-address=/api-int.$CLUSTER_DOMAIN/$MASTER1_IP
-address=/api-int.$CLUSTER_DOMAIN/$MASTER2_IP
+address=/api.$CLUSTER_DOMAIN/$BASTION_IP
+address=/api-int.$CLUSTER_DOMAIN/$BASTION_IP
 EOF
 
 # /etc/hosts can't round-robin (only first match wins), so remove api entries
@@ -214,7 +204,7 @@ fi
 
 systemctl restart dnsmasq
 
-echo "==> DNS flipped to round-robin across masters"
+echo "==> DNS flipped to bastion HAProxy (HAProxy load balances across masters)"
 
 # ── 13. Permanent CSR approval service ────────────────────────────────────────
 curl -sf "$REPO_URL/scripts/csr-approver.service" \
