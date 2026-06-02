@@ -203,7 +203,21 @@ defaults
     timeout client  50s
     timeout server  50s
 
+frontend mcs
+    bind *:22623
+    mode tcp
+    default_backend masters_mcs
+  
+backend masters_mcs
+    mode tcp
+    balance roundrobin
+    option tcp-check
+    server master21 $MASTER0_IP:22623 check inter 10s fall 2 rise 2
+    server master22 $MASTER1_IP:22623 check inter 10s fall 2 rise 2
+    server master23 $MASTER2_IP:22623 check inter 10s fall 2 rise 2
+
 frontend stats
+    mode http
     bind *:8404
     stats enable
     stats uri /stats
