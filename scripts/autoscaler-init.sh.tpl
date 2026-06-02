@@ -40,7 +40,7 @@ AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
 
 # ── Wait for bastion ──────────────────────────────────────────────────────────
 echo "==> Waiting for bastion..."
-until curl -sf "http://$BASTION_IP/ready" > /dev/null 2>&1; do
+until curl -sf "http://$BASTION_IP:8080/ready" > /dev/null 2>&1; do
   echo "  $(date) — waiting..."
   sleep 15
 done
@@ -76,27 +76,27 @@ chown ubuntu:ubuntu /opt/autoscaler
 
 # ── Wait for cluster to be ready then copy kubeconfig ─────────────────────────
 echo "==> Waiting for kubeconfig to be available..."
-until curl -sf "http://$BASTION_IP/auth/kubeconfig" > /dev/null 2>&1; do
+until curl -sf "http://$BASTION_IP:8080/auth/kubeconfig" > /dev/null 2>&1; do
   echo "  $(date) — waiting for cluster install to complete..."
   sleep 60
 done
 
-curl -s "http://$BASTION_IP/auth/kubeconfig" -o /opt/autoscaler/kubeconfig
+curl -s "http://$BASTION_IP:8080/auth/kubeconfig" -o /opt/autoscaler/kubeconfig
 cp /opt/autoscaler/kubeconfig /home/ubuntu/kubeconfig
 chown ubuntu:ubuntu /home/ubuntu/kubeconfig
 echo "export KUBECONFIG=/opt/autoscaler/kubeconfig" >> /home/ubuntu/.bashrc
 
 # ── Fetch autoscaler scripts from bastion ─────────────────────────────────────
 echo "==> Fetching autoscaler scripts"
-curl -sf "http://$BASTION_IP/autoscaler/webhook.py"        -o /opt/autoscaler/webhook.py
-curl -sf "http://$BASTION_IP/autoscaler/watcher.py"        -o /opt/autoscaler/watcher.py
-curl -sf "http://$BASTION_IP/autoscaler/requirements.txt"  -o /opt/autoscaler/requirements.txt
+curl -sf "http://$BASTION_IP:8080/autoscaler/webhook.py"        -o /opt/autoscaler/webhook.py
+curl -sf "http://$BASTION_IP:8080/autoscaler/watcher.py"        -o /opt/autoscaler/watcher.py
+curl -sf "http://$BASTION_IP:8080/autoscaler/requirements.txt"  -o /opt/autoscaler/requirements.txt
 
 # ── Fetch ignition stub template ──────────────────────────────────────────────
 # CHANGED: was node-init.sh.tpl (Ubuntu cloud-init for the volume-swap flow);
 # now the ignition stub used by webhook.py for RHCOS-direct-boot workers.
 echo "==> Fetching ignition stub template"
-curl -sf "http://$BASTION_IP/scripts/ignition-stub.json.tpl" \
+curl -sf "http://$BASTION_IP:8080/scripts/ignition-stub.json.tpl" \
   -o /opt/autoscaler/scripts/ignition-stub.json.tpl
 
 # ── Install python deps ───────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ pip3 install -r /opt/autoscaler/requirements.txt
 
 # ── Fetch and configure systemd service ───────────────────────────────────────
 echo "==> Configuring autoscaler service"
-curl -sf "http://$BASTION_IP/autoscaler/ocp-autoscaler.service" \
+curl -sf "http://$BASTION_IP:8080/autoscaler/ocp-autoscaler.service" \
   -o /etc/systemd/system/ocp-autoscaler.service
 
 # ── Resolve dynamic AWS values ────────────────────────────────────────────────

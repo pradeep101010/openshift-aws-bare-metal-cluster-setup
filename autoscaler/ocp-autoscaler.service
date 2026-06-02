@@ -9,6 +9,7 @@ WorkingDirectory=/opt/autoscaler
 Environment=KUBECONFIG=/opt/autoscaler/kubeconfig
 Environment=CLUSTER_NAME=__CLUSTER_NAME__
 Environment=BASTION_IP=__BASTION_IP__
+Environment=BASTION_DNS_REFRESH_URL=http://__BASTION_IP__:8080/cgi-bin/refresh-dns.sh
 Environment=RHCOS_AMI=__RHCOS_AMI__
 Environment=KEY_PAIR_NAME=__KEY_PAIR_NAME__
 Environment=RHCOS_DISK_SIZE_GB=__RHCOS_DISK_SIZE_GB__
@@ -23,9 +24,8 @@ Environment=MAX_WORKERS=10
 Environment=WEBHOOK_URL=http://localhost:8080/scale
 Environment=BASE_WORKER_IP=10.0.1
 Environment=BASE_WORKER_OFFSET=24
-ExecStart=/bin/bash -c \
-  'python3 /opt/autoscaler/webhook.py & \
-   python3 /opt/autoscaler/watcher.py'
+Environment=WORKER_CAPACITY_MILLI=1900
+ExecStart=/bin/bash -c 'python3 /opt/autoscaler/webhook.py & python3 /opt/autoscaler/watcher.py & wait -n'
 Restart=always
 RestartSec=10
 

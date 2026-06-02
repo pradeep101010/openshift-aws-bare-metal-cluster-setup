@@ -33,7 +33,7 @@ SCALE_UP_COOLDOWN   = int(os.environ.get('SCALE_UP_COOLDOWN',   '300'))
 SCALE_DOWN_COOLDOWN = int(os.environ.get('SCALE_DOWN_COOLDOWN', '300'))
 
 # Worker capacity hint used for batch scale-up sizing (millicores allocatable per worker)
-WORKER_CAPACITY_MILLI = int(os.environ.get('WORKER_CAPACITY_MILLI', '95500'))  # m5.metal default
+WORKER_CAPACITY_MILLI = int(os.environ.get('WORKER_CAPACITY_MILLI', '1900'))  # m5.metal default
 
 last_scale_up_at   = 0
 last_scale_down_at = 0

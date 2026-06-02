@@ -29,7 +29,7 @@ MIN_WORKERS         = int(os.environ.get('MIN_WORKERS',     '2'))
 MAX_WORKERS         = int(os.environ.get('MAX_WORKERS',     '10'))
 BASE_WORKER_IP      = os.environ.get('BASE_WORKER_IP',      '10.0.1')
 BASE_WORKER_OFFSET  = int(os.environ.get('BASE_WORKER_OFFSET', '24'))
-BASTION_DNS_REFRESH_URL = os.environ.get('BASTION_DNS_REFRESH_URL', f'http://{BASTION_IP}/cgi-bin/refresh-dns.sh')
+BASTION_DNS_REFRESH_URL = os.environ.get('BASTION_DNS_REFRESH_URL', f'http://{BASTION_IP}:8080/cgi-bin/refresh-dns.sh')
 
 
 STUB_TEMPLATE_PATH  = '/opt/autoscaler/scripts/ignition-stub.json.tpl'
