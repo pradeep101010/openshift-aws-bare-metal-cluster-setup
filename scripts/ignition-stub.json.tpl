@@ -4,7 +4,7 @@
     "config": {
       "merge": [
         {
-          "source": "http://${bastion_ip}/ignition/${role}.ign"
+          "source": "http://${bastion_ip}:8080/ignition/${role}.ign"
         }
       ]
     }
