@@ -69,7 +69,7 @@ resource "null_resource" "wait_for_bastion" {
     command = <<-EOT
       echo "Waiting for bastion to publish ignition files..."
       for i in $(seq 1 120); do
-        if curl -sf --max-time 10 http://${aws_instance.bastion.public_ip}/ignition/bootstrap.ign > /dev/null 2>&1; then
+        if curl -sf --max-time 10 http://${aws_instance.bastion.public_ip}:8080/ignition/bootstrap.ign > /dev/null 2>&1; then
           echo "Bastion ready — ignition files available"
           exit 0
         fi
