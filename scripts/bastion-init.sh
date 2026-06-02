@@ -31,7 +31,7 @@ echo "$BASTION_IP $(hostname)" >> /etc/hosts
 # ── 1. System packages ────────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq apache2 dnsmasq curl wget jq python3 awscli net-tools bind9-dnsutils
+apt-get install -y -qq apache2 dnsmasq curl wget jq python3 awscli net-tools bind9-dnsutils haproxy
 
 # ── 2. Configure dnsmasq ──────────────────────────────────────────────────────
 systemctl disable --now systemd-resolved || true
@@ -41,11 +41,11 @@ nameserver 127.0.0.1
 nameserver 169.254.169.253
 EOF
 
-# Build one *.apps record per worker — dnsmasq round-robins across them
-APPS_RECORDS=""
-for ip in $WORKER_IPS; do
-  APPS_RECORDS="${APPS_RECORDS}address=/.apps.$CLUSTER_DOMAIN/$ip"$'\n'
-done
+# # Build one *.apps record per worker — dnsmasq round-robins across them
+# APPS_RECORDS=""
+# for ip in $WORKER_IPS; do
+#   APPS_RECORDS="${APPS_RECORDS}address=/.apps.$CLUSTER_DOMAIN/$ip"$'\n'
+# done
 
 cat > /etc/dnsmasq.conf << EOF
 port=53
@@ -55,7 +55,7 @@ server=169.254.169.253
 
 address=/api.$CLUSTER_DOMAIN/$BOOTSTRAP_IP
 address=/api-int.$CLUSTER_DOMAIN/$BOOTSTRAP_IP
-${APPS_RECORDS}
+
 address=/etcd-0.$CLUSTER_DOMAIN/$MASTER0_IP
 address=/etcd-1.$CLUSTER_DOMAIN/$MASTER1_IP
 address=/etcd-2.$CLUSTER_DOMAIN/$MASTER2_IP
@@ -175,9 +175,6 @@ chown -R ubuntu:ubuntu $INSTALL_DIR
 sudo -u ubuntu openshift-install wait-for bootstrap-complete \
   --dir=$INSTALL_DIR --log-level=info 2>&1 | tee -a /var/log/bastion-init.log || true
 echo "==> bootstrap-complete reached"
-# ── 15b. Install HAProxy and configure as front-end LB ───────────────────────
-echo "==> Installing HAProxy"
-apt-get install -y -qq haproxy
 
 # Build initial server lines from WORKER_IPS env var
 HTTP_SERVERS=""
@@ -249,7 +246,7 @@ backend masters_api
 EOF
 
 sudo systemctl enable haproxy && sudo systemctl restart haproxy
-echo "==> HAProxy configured with workers: $WORKER_IPS"
+echo "==> HAProxy configured — workers: $WORKER_IPS | masters: $MASTER0_IP $MASTER1_IP $MASTER2_IP"
 
 
 # ── 12. Flip DNS bootstrap → bastion HAProxy ──────────────────────────────────
@@ -366,8 +363,6 @@ sleep 30
 echo "==> Master/worker separation complete"
 
 # Let cluster operators (auth, console) recover after router move
-sleep 30
-echo "==> Master/worker separation complete"
 
 
 # ── 16. Terminate bootstrap ───────────────────────────────────────────────────
@@ -391,7 +386,6 @@ oc patch machineset worker-autoscale -n openshift-machine-api \
 
 # ── 18. Publish autoscaler files ──────────────────────────────────────────────
 mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth $WEB_ROOT/scripts 
-mkdir -p $WEB_ROOT/autoscaler $WEB_ROOT/auth
 curl -sf "$REPO_URL/autoscaler/webhook.py"             -o $WEB_ROOT/autoscaler/webhook.py
 curl -sf "$REPO_URL/autoscaler/watcher.py"             -o $WEB_ROOT/autoscaler/watcher.py
 curl -sf "$REPO_URL/autoscaler/requirements.txt"       -o $WEB_ROOT/autoscaler/requirements.txt
@@ -413,9 +407,6 @@ sed -i "\|address=/\.apps\.$CLUSTER_DOMAIN/|d" /etc/dnsmasq.conf
 echo "address=/.apps.$CLUSTER_DOMAIN/$BASTION_IP" >> /etc/dnsmasq.conf
 systemctl restart dnsmasq
 echo "==> *.apps DNS now permanently points to bastion HAProxy"
-
-# refresh-apps-dns.sh is now replaced by refresh-haproxy.sh — keep the script
-# for reference but it no longer needs to update dnsmasq
 cat > /usr/local/bin/refresh-haproxy.sh << 'HAEOF'
 #!/bin/bash
 set -euo pipefail
@@ -429,10 +420,10 @@ TMPFILE=$(mktemp)
 echo "$(date) Refreshing HAProxy worker backends..."
 
 # Get all ready worker IPs from cluster
-WORKER_IPS=$(oc get nodes \
+WORKER_IPS=$(/usr/local/bin/oc get nodes \
   -l 'node-role.kubernetes.io/worker,!node-role.kubernetes.io/master' \
   --no-headers 2>/dev/null | awk '$2=="Ready" {print $1}' | while read node; do
-    oc get node "$node" \
+    /usr/local/bin/oc get node "$node" \
       -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null
     echo
   done | sort -u)
@@ -490,6 +481,7 @@ chown ubuntu:ubuntu /var/log/refresh-haproxy.log
 echo "==> refresh-haproxy.sh installed"
 
 #-- 20. CGI endpoint for webhook.py to call after scaling ----------------------
+sudo mkdir -p /var/www/cgi-bin
 sudo tee /var/www/cgi-bin/refresh-dns.sh > /dev/null <<'EOF'
 #!/bin/bash
 echo "Content-type: text/plain"
@@ -500,11 +492,9 @@ flock -n 200 || { echo "another refresh in progress"; exit 0; }
 
 /usr/local/bin/refresh-haproxy.sh 2>&1
 EOF
-
 sudo chmod +x /var/www/cgi-bin/refresh-dns.sh
+echo "CGI Endpoint for webhook configured"
 #-- 21. Configure Apache CGI support ------------------------------------------
-
-sudo mkdir -p /var/www/cgi-bin
 
 sudo tee /etc/apache2/conf-available/cgi.conf > /dev/null <<'EOF'
 ScriptAlias /cgi-bin/ /var/www/cgi-bin/
@@ -531,3 +521,5 @@ sudo systemctl is-active --quiet apache2 || {
     sudo journalctl -u apache2 --no-pager -n 50
     exit 1
 }
+echo "==> Apache CGI support configured"
+echo "==> Cluster setup complete"
