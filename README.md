@@ -18,24 +18,6 @@ It's a complete, opinionated reference for running OpenShift the hard way: you p
 
 ---
 
-## Architecture
-
-External clients ──► api   ─┐
-App users        ──► *.apps─┤   ┌─────────────────┐         ┌──────────────┐
-                            ├──►│    Bastion      │──6443─► │  Masters ×3  │
-New nodes (boot) ──► :8080 ─┘   │  DNS · ignition │ 22623   │ API·MCS·etcd │
-                                │  HAProxy LB     │──80/443┐└──────┬───────┘
-                                │  csr-approver   │        │   direct (overlay)
-                                └───────▲─────────┘        ▼  pods · etcd
-                                        │ refresh      ┌────────────────┐
-                                ┌───────┴─────────┐    │  Workers ×N    │
-                                │  Autoscaler     │──► │ router·kubelet │
-                                │ watcher+webhook │    └────────────────┘
-                                └───────┬─────────┘
-                                        └──► AWS EC2 API (launch / terminate)
-
----
-
 ## How it works
 
 The whole cluster pulls itself up in a fixed sequence, gated by Terraform:
