@@ -91,6 +91,7 @@ echo "==> Fetching autoscaler scripts"
 curl -sf "http://$BASTION_IP:8080/autoscaler/webhook.py"        -o /opt/autoscaler/webhook.py
 curl -sf "http://$BASTION_IP:8080/autoscaler/watcher.py"        -o /opt/autoscaler/watcher.py
 curl -sf "http://$BASTION_IP:8080/autoscaler/requirements.txt"  -o /opt/autoscaler/requirements.txt
+curl -sf "http://$BASTION_IP:8080/autoscaler/storage-watcher.py" -o /opt/autoscaler/storage-watcher.py
 
 # ── Fetch ignition stub template ──────────────────────────────────────────────
 # CHANGED: was node-init.sh.tpl (Ubuntu cloud-init for the volume-swap flow);

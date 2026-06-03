@@ -51,6 +51,7 @@ resource "aws_instance" "bastion" {
     master1_ip           = local.master_ips[1]
     master2_ip           = local.master_ips[2]
     worker_ips           = join(" ", local.worker_ips)
+    storage_ips = join(" ", local.storage_ips)
     subnet_cidr          = var.subnet_cidr
   }))
 

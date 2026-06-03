@@ -5,6 +5,7 @@ from kubernetes import client, config
 import threading
 
 scale_lock = threading.Lock()
+storage_scale_lock = threading.Lock()
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -30,6 +31,14 @@ MAX_WORKERS         = int(os.environ.get('MAX_WORKERS',     '10'))
 BASE_WORKER_IP      = os.environ.get('BASE_WORKER_IP',      '10.0.1')
 BASE_WORKER_OFFSET  = int(os.environ.get('BASE_WORKER_OFFSET', '24'))
 BASTION_DNS_REFRESH_URL = os.environ.get('BASTION_DNS_REFRESH_URL', f'http://{BASTION_IP}:8080/cgi-bin/refresh-dns.sh')
+BASE_STORAGE_OFFSET   = int(os.environ.get('BASE_STORAGE_OFFSET', '40'))
+STORAGE_INSTANCE_TYPE = os.environ.get('STORAGE_INSTANCE_TYPE', 't3.large')
+STORAGE_DISK_GB       = int(os.environ.get('STORAGE_DISK_GB', '200'))
+STORAGE_MIN           = int(os.environ.get('STORAGE_MIN', '3'))   # >= replica count
+STORAGE_MAX           = int(os.environ.get('STORAGE_MAX', '8'))
+LONGHORN_NS           = os.environ.get('LONGHORN_NS', 'longhorn-system')
+LONGHORN_GROUP        = 'longhorn.io'
+LONGHORN_VERSION      = os.environ.get('LONGHORN_VERSION', 'v1beta2')
 
 
 STUB_TEMPLATE_PATH  = '/opt/autoscaler/scripts/ignition-stub.json.tpl'
@@ -335,6 +344,121 @@ def scale_down(desired):
     refresh_bastion_dns() 
     logging.info(f"==> scale_down complete: removed {removed} workers, now at {final}")
 
+# ── Storage helpers ───────────────────────────────────────────────────────────
+def get_storage_node_count():
+    r = run(f"oc get nodes -l node-role.kubernetes.io/storage --no-headers "
+            f"--kubeconfig {KUBECONFIG} 2>/dev/null | grep -c Ready || true")
+    try: return int(r.stdout.strip())
+    except: return 0
+
+def pick_next_storage_slot():
+    r = run(f"aws ec2 describe-instances "
+            f"--filters 'Name=tag:OCPRole,Values=storage' "
+            f"'Name=instance-state-name,Values=running,pending,stopping,stopped' "
+            f"--query 'Reservations[].Instances[].PrivateIpAddress' "
+            f"--region {REGION} --output text")
+    used = set(r.stdout.strip().split())
+    for offset in range(0, STORAGE_MAX + 5):
+        ip = f"{BASE_WORKER_IP}.{BASE_STORAGE_OFFSET + offset}"
+        if ip not in used:
+            return offset, ip
+    raise RuntimeError("No free storage IP available")
+
+def provision_one_storage_node():
+    idx, ip = pick_next_storage_slot()
+    logging.info(f"==> Provisioning storage node idx={idx} ip={ip}")
+    stub = render_ignition_stub(role='worker')          # same ignition as workers
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write(stub); stub_path = f.name
+    r = run(
+        f"aws ec2 run-instances --image-id {RHCOS_AMI} "
+        f"--instance-type {STORAGE_INSTANCE_TYPE} --subnet-id {SUBNET_ID} "
+        f"--private-ip-address {ip} --iam-instance-profile Name={IAM_PROFILE} "
+        f"--security-group-ids {NODE_SG_ID} --placement AvailabilityZone={AZ} "
+        f"--key-name {KEY_PAIR_NAME} --associate-public-ip-address "
+        f"--metadata-options 'HttpEndpoint=enabled,HttpTokens=required,InstanceMetadataTags=enabled' "
+        f"--block-device-mappings '[{{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{{"
+        f"\"VolumeType\":\"gp3\",\"VolumeSize\":{STORAGE_DISK_GB},\"DeleteOnTermination\":true}}}}]' "
+        f"--user-data file://{stub_path} "
+        f"--tag-specifications 'ResourceType=instance,Tags=["
+        f"{{Key=Name,Value={CLUSTER_NAME}-storage{idx}}},{{Key=OCPRole,Value=storage}}]' "
+        f"--region {REGION}")
+    try: os.unlink(stub_path)
+    except OSError: pass
+    if r.returncode != 0:
+        logging.error(f"run-instances failed for storage{idx}"); return None
+    time.sleep(15)
+    return ip
+
+def label_taint_storage_node(node):
+    run(f"oc label node {node} node-role.kubernetes.io/storage='' --overwrite --kubeconfig {KUBECONFIG}")
+    run(f"oc label node {node} node.longhorn.io/create-default-disk=true --overwrite --kubeconfig {KUBECONFIG}")
+    run(f"oc adm taint node {node} storage=longhorn:NoSchedule --overwrite --kubeconfig {KUBECONFIG}")
+    logging.info(f"  labeled + tainted {node}")
+
+def newest_storage_node():
+    r = run(f"oc get nodes -l node-role.kubernetes.io/storage --no-headers "
+            f"--sort-by=.metadata.creationTimestamp --kubeconfig {KUBECONFIG}")
+    lines = [l for l in r.stdout.strip().split('\n') if l]
+    return lines[-1].split()[0] if lines else None
+
+def longhorn_replica_count(node):
+    crd = get_kube_client()
+    reps = crd.list_namespaced_custom_object(
+        group=LONGHORN_GROUP, version=LONGHORN_VERSION, namespace=LONGHORN_NS,
+        plural="replicas").get("items", [])
+    return sum(1 for x in reps if (x.get("spec") or {}).get("nodeID") == node)
+
+def evict_storage_node(node):
+    """Disable scheduling + request eviction; wait until the node holds zero replicas."""
+    crd = get_kube_client()
+    crd.patch_namespaced_custom_object(
+        group=LONGHORN_GROUP, version=LONGHORN_VERSION, namespace=LONGHORN_NS,
+        plural="nodes", name=node,
+        body={"spec": {"allowScheduling": False, "evictionRequested": True}})
+    logging.info(f"  eviction requested on Longhorn node {node}")
+    start = time.time()
+    while time.time() - start < 3600:
+        if longhorn_replica_count(node) == 0:
+            logging.info(f"  {node} drained to 0 replicas"); return True
+        time.sleep(30)
+    logging.error(f"  eviction timed out on {node}"); return False
+
+def scale_storage_up(desired):
+    current = get_storage_node_count()
+    logging.info(f"==> storage scale_up: {current} → {desired}")
+    launched = []
+    for _ in range(desired - current):
+        ip = provision_one_storage_node()
+        if ip: launched.append(ip)
+    for ip in launched:
+        node = "ip-" + ip.replace('.', '-')
+        start = time.time()
+        while time.time() - start < 1800:
+            r = run(f"oc get node {node} --no-headers --kubeconfig {KUBECONFIG} "
+                    f"2>/dev/null | grep -c ' Ready' || true")
+            if r.stdout.strip() == '1': break
+            time.sleep(30)
+        label_taint_storage_node(node)
+    # NOTE: no HAProxy refresh — storage nodes are not in the load-balancer path
+    logging.info(f"==> storage scale_up complete: {get_storage_node_count()} nodes")
+
+def scale_storage_down(desired):
+    current = get_storage_node_count()
+    logging.info(f"==> storage scale_down: {current} → {desired}")
+    for _ in range(current - desired):
+        if get_storage_node_count() <= STORAGE_MIN:
+            logging.info("  at STORAGE_MIN floor; stopping"); break
+        node = newest_storage_node()
+        if not node: break
+        if not evict_storage_node(node):
+            logging.error(f"  eviction failed for {node}; aborting"); break
+        inst = get_instance_id_by_ip(get_node_ip(node))
+        if inst and inst != 'None':
+            run(f"aws ec2 terminate-instances --instance-ids {inst} --region {REGION}")
+            run(f"aws ec2 wait instance-terminated --instance-ids {inst} --region {REGION}")
+        run(f"oc delete node {node} --kubeconfig {KUBECONFIG}")
+        logging.info(f"  removed storage node {node}")
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
@@ -370,6 +494,23 @@ def handle_scale():
         return jsonify({"status": "ok", "desired": desired, "previous": current, "current": final})
     finally:
         scale_lock.release()
+@app.route('/scale-storage', methods=['POST'])
+def handle_scale_storage():
+    data = request.json or {}
+    desired = data.get('desired')
+    if desired is None:
+        return jsonify({"error": "desired count required"}), 400
+    if not storage_scale_lock.acquire(blocking=False):
+        return jsonify({"status": "busy"}), 409
+    try:
+        current = get_storage_node_count()
+        desired = max(STORAGE_MIN, min(STORAGE_MAX, desired))
+        if   desired > current: scale_storage_up(desired)
+        elif desired < current: scale_storage_down(desired)
+        return jsonify({"status": "ok", "desired": desired,
+                        "previous": current, "current": get_storage_node_count()})
+    finally:
+        storage_scale_lock.release()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)

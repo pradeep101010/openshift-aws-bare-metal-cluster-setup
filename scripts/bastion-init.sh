@@ -538,4 +538,44 @@ sudo systemctl is-active --quiet apache2 || {
     exit 1
 }
 echo "==> Apache CGI support configured"
+# ── 22. Storage tier: label/taint initial storage nodes + install Longhorn ────
+echo "==> Setting up storage tier"
+LONGHORN_VERSION="v1.7.2"   # pin a current release
+
+# Storage IPs come from Terraform, like WORKER_IPS
+for ip in $STORAGE_IPS; do
+  node="ip-$(echo $ip | tr '.' '-')"
+  echo "  waiting for storage node $node to join..."
+  until oc get node "$node" >/dev/null 2>&1; do sleep 10; done
+  oc label  node "$node" node-role.kubernetes.io/storage='' --overwrite
+  oc label  node "$node" node.longhorn.io/create-default-disk=true --overwrite
+  oc adm taint node "$node" storage=longhorn:NoSchedule --overwrite
+  echo "  labeled + tainted $node"
+done
+
+# RHCOS prerequisite: Longhorn needs iscsid running
+oc apply -f "https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERSION}/deploy/prerequisite/longhorn-iscsi-installation.yaml"
+
+# Install Longhorn:
+#  - only labeled storage nodes contribute disk (createDefaultDiskLabeledNodes)
+#  - Longhorn's own pods tolerate the storage taint
+#  - 3 replicas, no over-provisioning
+helm repo add longhorn https://charts.longhorn.io && helm repo update
+helm install longhorn longhorn/longhorn \
+  --namespace longhorn-system --create-namespace --version "${LONGHORN_VERSION}" \
+  --set defaultSettings.createDefaultDiskLabeledNodes=true \
+  --set defaultSettings.defaultReplicaCount=3 \
+  --set defaultSettings.storageOverProvisioningPercentage=100 \
+  --set defaultSettings.taintToleration="storage=longhorn:NoSchedule"
+
+# Make Longhorn the default StorageClass
+until oc get storageclass longhorn >/dev/null 2>&1; do sleep 10; done
+oc patch storageclass longhorn -p \
+  '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+# Publish the storage watcher so the autoscaler box can pull it
+curl -sf "$REPO_URL/autoscaler/storage-watcher.py" -o $WEB_ROOT/autoscaler/storage-watcher.py
+chown www-data:www-data $WEB_ROOT/autoscaler/storage-watcher.py
+
+echo "==> storage tier ready"
 echo "==> Cluster setup complete"

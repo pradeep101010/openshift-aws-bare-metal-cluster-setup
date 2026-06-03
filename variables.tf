@@ -99,3 +99,6 @@ variable "rhcos_disk_size_gb" {
   type        = number
   default     = 130
 }
+variable "storage_node_count"    { default = 3 }        # initial pool; must be >= replica count
+variable "storage_instance_type" { default = "t3.large" }
+variable "storage_disk_gb"       { default = 200 }       # big root disk; Longhorn uses /var/lib/longhorn

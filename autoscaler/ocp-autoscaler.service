@@ -25,7 +25,12 @@ Environment=WEBHOOK_URL=http://localhost:8080/scale
 Environment=BASE_WORKER_IP=10.0.1
 Environment=BASE_WORKER_OFFSET=24
 Environment=WORKER_CAPACITY_MILLI=1900
-ExecStart=/bin/bash -c 'python3 /opt/autoscaler/webhook.py & python3 /opt/autoscaler/watcher.py & wait -n'
+Environment=STORAGE_MIN=3
+Environment=STORAGE_MAX=8
+Environment=STORAGE_INSTANCE_TYPE=t3.large
+Environment=STORAGE_DISK_GB=200
+Environment=BASE_STORAGE_OFFSET=40
+ExecStart=/bin/bash -c 'python3 /opt/autoscaler/webhook.py & python3 /opt/autoscaler/watcher.py & python3 /opt/autoscaler/storage-watcher.py & wait -n'
 Restart=always
 RestartSec=10
 
