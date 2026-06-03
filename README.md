@@ -1,279 +1,223 @@
-# OpenShift 4.14 on AWS Bare Metal — Terraform
+# OpenShift on AWS — bare-metal-style UPI cluster
 
-Deploys a full OpenShift 4.14 UPI cluster on AWS using `m5.metal` bare metal
-instances.
+Terraform that stands up a self-hosting OpenShift 4.14 cluster on plain AWS EC2 (`platform: none`), fronts it with a bastion that does its own DNS and load balancing, and grows and shrinks the worker pool with a custom pod-driven autoscaler — all without depending on a single managed AWS service like ELB or Route 53.
 
-Since AWS bare metal instances do not expose EFI PXE boot, this setup uses
-**coreos-installer** running from Ubuntu user-data to write RHCOS to a
-secondary EBS volume. The bastion then orchestrates an automated volume swap
-so each instance boots into RHCOS.
+It's a complete, opinionated reference for running OpenShift the hard way: you provide the compute and network, ignition turns blank RHCOS machines into cluster members, and the cluster keeps itself running.
+
+> ⚠️ **This is a proof-of-concept / learning build.** The bastion is a deliberate single point of failure (see [Notes & caveats](#notes--caveats)). Don't run it as-is for production without making DNS and load balancing redundant.
+
+---
+
+## What you get
+
+- **One-command bring-up** — `terraform apply` provisions everything and self-gates through bootstrap in the right order.
+- **No cloud-LB dependency** — HAProxy on the bastion fronts the Kubernetes API, the Machine Config Server, and the apps ingress, all with health checks.
+- **Self-registering nodes** — RHCOS workers boot from an ignition stub, fetch their real config from the cluster, and a CSR-approver service waves them in automatically.
+- **Custom autoscaler** — watches for genuinely-unschedulable pods, launches RHCOS workers on demand, drains and removes idle ones, and keeps the load balancer in sync after every scaling event.
+- **Cloud-agnostic by design** — the load-balancing and DNS patterns port to any bare-metal-ish environment, not just AWS.
 
 ---
 
 ## Architecture
 
-```
-                         VPC 10.0.0.0/16
-                         Subnet 10.0.0.0/20
-┌─────────────────────────────────────────────────────┐
-│                                                     │
-│  Bastion (t3.xlarge, Ubuntu)          10.0.1.10    │
-│  ├── Apache      → serves RHCOS + ignition + tools │
-│  ├── dnsmasq     → DNS for api.*, etcd-*, *.apps.* │
-│  ├── openshift-install → generates ignition configs│
-│  └── orchestrator → volume swap + CSR approval     │
-│                                                     │
-│  Bootstrap (m5.metal, RHCOS)          10.0.1.20    │
-│  ├── etcd (temporary)                              │
-│  ├── kube-apiserver (temporary)                    │
-│  └── machine-config-server                         │
-│                                                     │
-│  Master0  (m5.metal, RHCOS)           10.0.1.21    │
-│  Master1  (m5.metal, RHCOS)           10.0.1.22    │
-│  Master2  (m5.metal, RHCOS)           10.0.1.23    │
-│                                                     │
-│  Worker0  (m5.metal, RHCOS)           10.0.1.24    │
-│  Worker1  (m5.metal, RHCOS)           10.0.1.25    │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-```
+External clients ──► api   ─┐
+App users        ──► *.apps─┤   ┌─────────────────┐         ┌──────────────┐
+                            ├──►│    Bastion      │──6443─► │  Masters ×3  │
+New nodes (boot) ──► :8080 ─┘   │  DNS · ignition │ 22623   │ API·MCS·etcd │
+                                │  HAProxy LB     │──80/443┐└──────┬───────┘
+                                │  csr-approver   │        │   direct (overlay)
+                                └───────▲─────────┘        ▼  pods · etcd
+                                        │ refresh      ┌────────────────┐
+                                ┌───────┴─────────┐    │  Workers ×N    │
+                                │  Autoscaler     │──► │ router·kubelet │
+                                │ watcher+webhook │    └────────────────┘
+                                └───────┬─────────┘
+                                        └──► AWS EC2 API (launch / terminate)
 
 ---
 
-## How it works end to end
+## How it works
 
-```
-terraform apply
-  │
-  ├── Bastion boots (Ubuntu)
-  │     └── bastion-init.sh:
-  │           1.  Fix DNS → 169.254.169.253 (before dnsmasq is up)
-  │           2.  Install packages (apache2, dnsmasq, awscli)
-  │           3.  Configure dnsmasq (api.*, etcd.*, *.apps.*)
-  │           4.  Download openshift-install + oc + kubectl
-  │           5.  Download RHCOS metal image (~1GB)
-  │           6.  Download coreos-installer binary
-  │           7.  Generate ignition configs (bootstrap/master/worker)
-  │           8.  Serve everything via Apache on port 80
-  │           9.  Signal /ready → nodes start polling
-  │           10. Wait for all 6 nodes to complete coreos-installer
-  │           11. Volume swap ALL nodes (stop → detach → attach → start)
-  │           12. Wait for all nodes to boot RHCOS
-  │           13. Run wait-for-bootstrap-complete
-  │           14. Update DNS: api.* → master0 (bootstrap done)
-  │           15. Approve worker CSRs (two rounds)
-  │           16. Run wait-for-install-complete
-  │           17. Print console URL + kubeadmin password
-  │
-  ├── Each node boots (Ubuntu, 20GB root + 130GB data volume)
-  │     └── node-init.sh:
-  │           1. Fix DNS → 169.254.169.253
-  │           2. Add hostname to /etc/hosts
-  │           3. Use IMDSv2 for instance metadata
-  │           4. Wait for bastion /ready
-  │           5. Fetch coreos-installer from bastion (not internet)
-  │           6. Detect 130GB secondary disk (/dev/nvme1n1 or /dev/xvdf)
-  │           7. Run coreos-installer → write RHCOS to data volume
-  │           8. POST to bastion /status/<node> → "done"
-  │           ← bastion takes over from here
-  │
-  └── Bastion orchestrates the rest
-        └── volume swap → RHCOS boot → bootstrap → CSRs → install complete
-```
+The whole cluster pulls itself up in a fixed sequence, gated by Terraform:
+
+1. **Bastion boots** and configures DNS (`dnsmasq`), an ignition file server (Apache on `:8080`), and downloads the OpenShift tooling. It generates the ignition configs and publishes them.
+2. **Terraform Gate 1** waits until the bastion is serving ignition.
+3. **Bootstrap + masters boot**, fetch their ignition, and form a control plane. The bootstrap node temporarily acts as the API until the masters take over, then it's terminated.
+4. **Bastion installs HAProxy**, then flips the `api`/`api-int` DNS records to point at itself. (Order matters — HAProxy must be listening before the flip, or the API wait hangs.)
+5. **Terraform Gate 2** waits for `bootstrap-complete`.
+6. **Workers boot**, fetch their config (stub from `:8080`, then full config from the Machine Config Server on `:22623` via the bastion), submit CSRs, and the `csr-approver` service approves them.
+7. **Bastion finishes up** — marks masters unschedulable, moves the routers onto workers, applies the autoscaler manifests, and publishes the autoscaler payload.
+8. **Autoscaler EC2 boots**, pulls its scripts and kubeconfig from the bastion, and starts watching.
+
 
 ---
 
-## Why no PXE?
+## Repository layout
 
-AWS EC2 instances (including bare metal m5.metal) do not expose a
-network PXE boot option via EFI. Instead of PXE, each node:
-
-1. Boots Ubuntu (already has network + OS)
-2. Runs `coreos-installer` to write RHCOS to a secondary EBS volume
-3. Bastion stops the instance, swaps the root volume to the RHCOS volume
-4. Instance restarts into RHCOS
-
-This achieves the same result as PXE without requiring network boot support.
-
----
-
-## Why bastion does the volume swap (not the node itself)
-
-The node needs to stop itself to swap volumes — but the AWS CLI on the
-node runs as a foreground process. When the instance stops, the process
-is killed before it can complete the swap.
-
-The bastion stays running throughout and orchestrates the swap externally
-via AWS API — no race condition.
+```
+.
+├── versions.tf                 # provider + Terraform version constraints
+├── variables.tf                # input variables
+├── locals.tf                   # IP layout, tags, derived names
+├── network.tf                  # VPC, subnet, security groups
+├── iam.tf                      # instance profile / roles
+├── data.tf                     # RHCOS + Ubuntu AMI lookups
+├── instances.tf                # bastion, autoscaler, masters, workers, gates
+├── outputs.tf
+├── terraform.tfvars.example
+├── scripts/
+│   ├── bastion-init-bootstrap.sh.tpl   # everything the bastion runs on boot
+│   ├── autoscaler-init.sh.tpl          # autoscaler EC2 setup
+│   ├── ignition-stub.json.tpl          # the tiny first-boot config every node gets
+│   └── csr-approver.service            # auto-approves node CSRs
+└── autoscaler/
+    ├── watcher.py                      # decides when/how much to scale
+    ├── webhook.py                      # launches/terminates nodes, refreshes HAProxy
+    ├── requirements.txt
+    ├── ocp-autoscaler.service          # systemd unit + tunables
+    └── manifests/
+        ├── machineset.yaml
+        ├── cluster-autoscaler.yaml
+        └── machine-autoscaler.yaml
+```
 
 ---
 
 ## Prerequisites
 
-| Tool | Version |
-|------|---------|
-| Terraform | >= 1.3 |
-| AWS CLI | >= 2.x |
-| AWS credentials | `aws configure` or IAM role |
-
-**AWS vCPU limit** — m5.metal has 96 vCPUs. 6 nodes = 576 vCPUs.
-Request an increase at EC2 → Limits → Running On-Demand Metal instances.
+- An AWS account and credentials with EC2, IAM, and VPC permissions
+- [Terraform](https://developer.hashicorp.com/terraform/downloads)
+- An OpenShift **pull secret** ([console.redhat.com](https://console.redhat.com/openshift/install/pull-secret))
+- An SSH key pair (you'll provide the public key; the private key is used for the bring-up gates)
+- A base domain you control (or accept the example domain for internal-only use)
 
 ---
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Fill in your values
-cp terraform.tfvars.example terraform.tfvars
-vim terraform.tfvars
+git clone https://github.com/pradeep101010/openshift-aws-bare-metal-cluster-setup.git
+cd openshift-aws-bare-metal-cluster-setup
 
-# 2. Deploy
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars — at minimum set pull_secret, ssh_public_key, base_domain
+
 terraform init
 terraform plan
 terraform apply
-
-# 3. Monitor — that's it
-BASTION=$(terraform output -raw bastion_public_ip)
-ssh -i <key.pem> ubuntu@$BASTION 'tail -f /var/log/bastion-init.log'
 ```
 
-The bastion log will show every step. When it prints:
+`apply` returns once the masters are up, but **workers and the autoscaler finish asynchronously**. Watch progress and confirm:
 
-```
-OCP CLUSTER READY
-Console: https://console-openshift-console.apps.ocp-poc.example.com
-kubeadmin password: XXXXX-XXXXX-XXXXX-XXXXX
+```bash
+# from the bastion (terraform output gives its public IP)
+ssh -i <your-key>.pem ubuntu@<bastion-ip>
+tail -f /var/log/bastion-init.log
+
+oc get nodes          # expect 3 masters + your initial workers, all Ready
+oc get co             # all ClusterOperators Available
 ```
 
-Your cluster is up. No other steps needed.
+> RHCOS nodes use the `core` user for SSH, not `ubuntu`.
 
 ---
 
-## DNS
+## Configuration
 
-All OCP DNS is served by dnsmasq on the bastion. The VPC DHCP options
-set points all VPC instances to `10.0.1.10` for DNS.
+Set in `terraform.tfvars`:
 
-| Record | During install | After bootstrap |
-|--------|---------------|-----------------|
-| `api.ocp-poc.example.com` | `10.0.1.20` (bootstrap) | `10.0.1.21` (master0) |
-| `api-int.ocp-poc.example.com` | `10.0.1.20` (bootstrap) | `10.0.1.21` (master0) |
-| `*.apps.ocp-poc.example.com` | `10.0.1.24` (worker0) | `10.0.1.24` (worker0) |
-| `etcd-0.ocp-poc.example.com` | `10.0.1.21` (master0) | `10.0.1.21` (master0) |
-| `etcd-1.ocp-poc.example.com` | `10.0.1.22` (master1) | `10.0.1.22` (master1) |
-| `etcd-2.ocp-poc.example.com` | `10.0.1.23` (master2) | `10.0.1.23` (master2) |
+| Variable | Example | Notes |
+|---|---|---|
+| `cluster_name` | `ocp-poc` | also the DNS + tag prefix |
+| `base_domain` | `example.com` | cluster domain is `<cluster_name>.<base_domain>` |
+| `ocp_version` | `4.14.x` | must match an available RHCOS AMI |
+| `subnet_cidr` | `10.0.1.0/24` | the machine network |
+| `availability_zone` | `us-east-1a` | single-AZ POC layout |
+| `bastion_instance_type` | `t3.medium` | bastion sizing |
+| `master_instance_type` | `m5.xlarge` | control-plane sizing |
+| `worker_instance_type` | `t3.medium` | worker sizing |
+| `rhcos_disk_size_gb` | `130` | root volume per node |
+| `key_pair_name` | `ocp-key` | EC2 key pair name |
+| `ssh_public_key` | `ssh-ed25519 ...` | injected into nodes |
+| `pull_secret` | `{...}` | Red Hat pull secret |
 
-The bastion automatically updates `api.*` from bootstrap to master0
-after `bootstrap-complete` succeeds.
+### Autoscaler tunables
+
+Set as `Environment=` lines in `autoscaler/ocp-autoscaler.service`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIN_WORKERS` | `2` | floor |
+| `MAX_WORKERS` | `10` | ceiling |
+| `WORKER_CAPACITY_MILLI` | `1900` | per-worker allocatable mCPU — **must match your instance type** |
+| `POLL_INTERVAL` | `30` | seconds between checks |
+| `PENDING_THRESHOLD` | `1` | pending pods that trigger scale-up |
+| `UTILIZATION_THRESHOLD` | `0.5` | scale-down trigger |
+| `UNNEEDED_TIME` | `600` | seconds of idle before removal |
+| `SCALE_UP_COOLDOWN` / `SCALE_DOWN_COOLDOWN` | `300` | anti-flap |
 
 ---
 
-## Static IPs
+## Operating the cluster
 
-| Node | IP | Role |
-|------|----|------|
-| Bastion | 10.0.1.10 | Infrastructure |
-| Bootstrap | 10.0.1.20 | Temporary (destroyed after install) |
-| Master 0 | 10.0.1.21 | Control plane + etcd |
-| Master 1 | 10.0.1.22 | Control plane + etcd |
-| Master 2 | 10.0.1.23 | Control plane + etcd |
-| Worker 0 | 10.0.1.24 | Compute + ingress |
-| Worker 1 | 10.0.1.25 | Compute |
+**Watch the autoscaler**
+
+```bash
+ssh -i <key>.pem ubuntu@<autoscaler-ip>
+sudo journalctl -u ocp-autoscaler -f
+```
+
+**Trigger a scale manually** (bypasses the watcher)
+
+```bash
+curl -s -XPOST http://<autoscaler-ip>:8080/scale \
+  -H 'Content-Type: application/json' -d '{"desired":4}'
+```
+
+**Smoke-test autoscaling** — deploy pods sized to fit one-per-node on your instance type (≈`1500m` CPU each on a `t3.medium`):
+
+```bash
+oc new-project autoscaler-test
+oc create deployment hog --image=registry.k8s.io/pause:3.9 --replicas=8 -n autoscaler-test
+oc set resources deployment hog -n autoscaler-test --requests=cpu=1500m,memory=2Gi
+# watch it scale up, then:
+oc delete deployment hog -n autoscaler-test   # watch it scale back down
+```
+
+**Inspect the load balancer**
+
+```bash
+# on the bastion
+echo "show stat" | sudo socat stdio /run/haproxy/admin.sock | awk -F, '{print $1,$2,$18}' | column -t
+sudo /usr/local/bin/refresh-haproxy.sh   # manually re-sync worker backends
+```
 
 ---
 
-## Cost
+## Notes & caveats
 
-| Instance | Type | Cost/hr | Count | Total/hr |
-|----------|------|---------|-------|----------|
-| Bastion | t3.xlarge | $0.166 | 1 | $0.17 |
-| Nodes | m5.metal | $4.608 | 6 | $27.65 |
-| **Total** | | | | **~$27.82/hr** |
+- **The bastion is a single point of failure.** API access, app ingress, node provisioning, and DNS all run through it. If it dies, existing pods and etcd keep working, but kubelets gradually lose the API and no new nodes can join. Make DNS + LB redundant before relying on this.
+- **Apache runs on port 8080, not 80** — HAProxy owns 80 for app traffic. Every bastion HTTP reference (ignition stub, Terraform gates, autoscaler init, webhook callback) must use `:8080`.
+- **HAProxy must front port 22623** (the Machine Config Server) or workers fetch their stub, then hang forever trying to get their full config. This is the easiest thing to forget.
+- **`WORKER_CAPACITY_MILLI` must match the worker instance type.** The wrong value makes scale-up under-provision (e.g. an m5 value on a t3.medium adds one node when you need several).
+- **Size pod requests to fit a node.** A pod requesting more CPU/memory than one worker has will stay `Pending` no matter how many nodes the autoscaler adds.
+- **Small workers + OpenShift monitoring don't mix well.** On `t3.medium` the monitoring stack may run degraded; add workers or trim it. It doesn't affect application workloads.
 
-**~$668/day. Destroy when not in use:**
+---
+
+## Teardown
 
 ```bash
 terraform destroy
 ```
 
----
+If the autoscaler launched workers outside Terraform's state, terminate them first so `destroy` isn't left with dangling instances:
 
-## Troubleshooting
-
-**Watch bastion progress:**
 ```bash
-ssh ubuntu@<bastion_ip> 'tail -f /var/log/bastion-init.log'
-```
-
-**Node stuck waiting for bastion:**
-```bash
-aws ssm start-session --target <instance-id>
-sudo tail -f /var/log/ocp-node-init.log
-```
-
-**coreos-installer failed:**
-```bash
-# Check if bastion is serving files
-curl http://10.0.1.10/ready
-curl http://10.0.1.10/ignition/master.ign | head -c 50
-ls /var/www/html/rhcos/
-```
-
-**Volume swap failed:**
-```bash
-# Check bastion log — swap runs from bastion now
-ssh ubuntu@<bastion_ip> 'grep -i swap /var/log/bastion-init.log'
-```
-
-**Bootstrap API not starting:**
-```bash
-ssh -i <key.pem> core@10.0.1.20   # from bastion
-sudo journalctl -b -u bootkube -f
-sudo crictl ps -a
-```
-
-**API unreachable after bootstrap:**
-```bash
-# DNS may still point to bootstrap — update manually
-sudo sed -i 's|/10.0.1.20|/10.0.1.21|g' /etc/dnsmasq.conf
-sudo systemctl restart dnsmasq
-curl -k https://api.ocp-poc.example.com:6443/healthz
-```
-
-**Workers not joining:**
-```bash
-# Approve CSRs — two rounds needed
-export KUBECONFIG=/home/ubuntu/ocp-install/auth/kubeconfig
-oc get csr | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
-# Wait 60s then run again
-```
-
-**Workers not pingable after reboot:**
-```bash
-# Stop/start the worker instances to force network re-init
-aws ec2 stop-instances --instance-ids <id> --region us-east-1
-aws ec2 wait instance-stopped --instance-ids <id> --region us-east-1
-aws ec2 start-instances --instance-ids <id> --region us-east-1
+aws ec2 describe-instances \
+  --filters 'Name=tag:OCPRole,Values=worker' 'Name=instance-state-name,Values=running' \
+  --query 'Reservations[].Instances[].InstanceId' --region <region> --output text \
+| xargs -r aws ec2 terminate-instances --region <region> --instance-ids
 ```
 
 ---
-
-## File Structure
-
-```
-ocp-terraform/
-├── main.tf                    Provider, Ubuntu AMI data source
-├── variables.tf               All input variables
-├── locals.tf                  Static IPs, node definitions
-├── vpc.tf                     VPC, subnet, IGW, routes, DHCP options
-├── security_groups.tf         Bastion + node security groups
-├── iam.tf                     IAM role (EC2 + SSM permissions)
-├── instances.tf               Bastion + 6 nodes + 6 RHCOS EBS volumes
-├── outputs.tf                 IPs, URLs, SSH commands
-├── terraform.tfvars.example   Example variable values
-├── complete-setup.sh          Manual fallback monitoring script
-└── scripts/
-    ├── bastion-init.sh.tpl    Full automation: setup + swap + install
-    └── node-init.sh.tpl       RHCOS install + notify bastion
-```
