@@ -16,6 +16,7 @@ export MASTER2_IP="${master2_ip}"
 export WORKER_IPS="${worker_ips}"
 export SUBNET_CIDR="${subnet_cidr}"
 export NODE_SSH_KEY='${node_ssh_private_key}'
+export STORAGE_IPS="${storage_ips}"
 
 # Fix hostname
 echo "127.0.0.1 $(hostname)" >> /etc/hosts

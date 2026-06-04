@@ -34,4 +34,10 @@ locals {
     ManagedBy   = "terraform"
     Environment = "poc"
   }
+  storage_base_offset = 40
+  storage_nodes = {
+    for i in range(var.storage_node_count) :
+    "storage${i}" => { ip = "10.0.1.${local.storage_base_offset + i}" }
+  }
+  storage_ips = [for k, v in local.storage_nodes : v.ip]
 }
