@@ -560,6 +560,9 @@ oc apply -f "https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERS
 #  - only labeled storage nodes contribute disk (createDefaultDiskLabeledNodes)
 #  - Longhorn's own pods tolerate the storage taint
 #  - 3 replicas, no over-provisioning
+HELM_VERSION="v3.16.3"
+curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tgz
+tar -xzf /tmp/helm.tgz -C /tmp && mv /tmp/linux-amd64/helm /usr/local/bin/helm
 helm repo add longhorn https://charts.longhorn.io && helm repo update
 helm install longhorn longhorn/longhorn \
   --namespace longhorn-system --create-namespace --version "${LONGHORN_VERSION}" \
