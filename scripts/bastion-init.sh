@@ -538,45 +538,97 @@ sudo systemctl is-active --quiet apache2 || {
     exit 1
 }
 echo "==> Apache CGI support configured"
-# ── 22. Storage tier: label/taint initial storage nodes + install Longhorn ────
+# ── 22. Storage tier: install Longhorn, grant SCCs, shape the tiers ───────────
 echo "==> Setting up storage tier"
-LONGHORN_VERSION="v1.7.2"   # pin a current release
+LONGHORN_VERSION="v1.7.2"
+HELM_VERSION="v3.16.3"
+STORAGE_IPS="${STORAGE_IPS:-}"          # guard against set -u if Terraform didn't pass it
 
-# Storage IPs come from Terraform, like WORKER_IPS
+# ── 22a. Label + taint the initial storage nodes ─────────────────────────────
 for ip in $STORAGE_IPS; do
   node="ip-$(echo $ip | tr '.' '-')"
   echo "  waiting for storage node $node to join..."
-  until oc get node "$node" >/dev/null 2>&1; do sleep 10; done
-  oc label  node "$node" node-role.kubernetes.io/storage='' --overwrite
-  oc label  node "$node" node.longhorn.io/create-default-disk=true --overwrite
+  for i in $(seq 1 60); do oc get node "$node" >/dev/null 2>&1 && break; sleep 10; done
+  oc label   node "$node" node-role.kubernetes.io/storage='' --overwrite
+  oc label   node "$node" node.longhorn.io/create-default-disk=true --overwrite
   oc adm taint node "$node" storage=longhorn:NoSchedule --overwrite
   echo "  labeled + tainted $node"
 done
 
-# RHCOS prerequisite: Longhorn needs iscsid running
+# ── 22b. RHCOS prerequisite: iscsid (runs on compute nodes, where volumes attach) ─
 oc apply -f "https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERSION}/deploy/prerequisite/longhorn-iscsi-installation.yaml"
 
-# Install Longhorn:
-#  - only labeled storage nodes contribute disk (createDefaultDiskLabeledNodes)
-#  - Longhorn's own pods tolerate the storage taint
-#  - 3 replicas, no over-provisioning
-HELM_VERSION="v3.16.3"
+# ── 22c. Install Helm + Longhorn (idempotent) ────────────────────────────────
 curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tgz
 tar -xzf /tmp/helm.tgz -C /tmp && mv /tmp/linux-amd64/helm /usr/local/bin/helm
 helm repo add longhorn https://charts.longhorn.io && helm repo update
-helm install longhorn longhorn/longhorn \
+helm upgrade --install longhorn longhorn/longhorn \
   --namespace longhorn-system --create-namespace --version "${LONGHORN_VERSION}" \
   --set defaultSettings.createDefaultDiskLabeledNodes=true \
   --set defaultSettings.defaultReplicaCount=3 \
   --set defaultSettings.storageOverProvisioningPercentage=100 \
   --set defaultSettings.taintToleration="storage=longhorn:NoSchedule"
 
-# Make Longhorn the default StorageClass
-until oc get storageclass longhorn >/dev/null 2>&1; do sleep 10; done
+# ── 22d. OpenShift SCCs — THE critical step the upstream docs omit ────────────
+# Every privileged Longhorn component (manager, instance-manager, CSI driver/
+# sidecars) is rejected by restricted-v2 until its ServiceAccount has 'privileged'.
+# The chart creates SAs lazily, so wait for them, then grant to ALL of them.
+echo "  waiting for Longhorn service accounts..."
+for i in $(seq 1 30); do
+  [ "$(oc get sa -n longhorn-system --no-headers 2>/dev/null | wc -l)" -gt 3 ] && break
+  sleep 10
+done
+for sa in $(oc get sa -n longhorn-system -o jsonpath='{.items[*].metadata.name}'); do
+  oc adm policy add-scc-to-user privileged -z "$sa" -n longhorn-system
+done
+# UI is nginx — it needs anyuid (write to /var/log/nginx, /var/lib/nginx), not privileged
+oc adm policy add-scc-to-user anyuid -z longhorn-ui-service-account -n longhorn-system
+
+# ── 22e. Force the taint-toleration onto the manager DaemonSet ────────────────
+# --set defaultSettings.taintToleration does NOT reach the manager DS pod spec at
+# install time (chicken-and-egg: the manager applies the setting but can't bootstrap
+# onto a tainted node first). Patch it directly so the manager lands on .40-.42.
+oc patch ds longhorn-manager -n longhorn-system --type=merge -p '{
+  "spec":{"template":{"spec":{"tolerations":[
+    {"key":"storage","value":"longhorn","effect":"NoSchedule","operator":"Equal"}
+  ]}}}}'
+oc patch setting taint-toleration -n longhorn-system \
+  --type=merge -p '{"value":"storage=longhorn:NoSchedule"}' 2>/dev/null || true
+
+# Restart so every component recreates under the granted SCC + toleration
+oc rollout restart ds/longhorn-manager -n longhorn-system
+
+# ── 22f. Wait for the StorageClass (bounded) + make it default ────────────────
+for i in $(seq 1 60); do
+  oc get storageclass longhorn >/dev/null 2>&1 && break
+  echo "  waiting for longhorn StorageClass ($i/60)..."; sleep 10
+done
 oc patch storageclass longhorn -p \
   '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
-# Publish the storage watcher so the autoscaler box can pull it
+# ── 22g. Shape the tiers: workers attach volumes but never host replicas ──────
+# Storage nodes (.40+) keep allowScheduling=true (set by create-default-disk).
+# Disable scheduling on the compute workers so replicas only ever land on storage.
+for ip in $WORKER_IPS; do
+  node="ip-$(echo $ip | tr '.' '-')"
+  for i in $(seq 1 30); do
+    oc -n longhorn-system get nodes.longhorn.io "$node" >/dev/null 2>&1 && break; sleep 5
+  done
+  oc -n longhorn-system patch nodes.longhorn.io "$node" \
+    --type=merge -p '{"spec":{"allowScheduling":false}}' 2>/dev/null || true
+done
+
+# ── 22h. Verify storage disks come online before declaring success ────────────
+echo "  waiting for storage disks to register..."
+for i in $(seq 1 30); do
+  ready=$(oc get nodes.longhorn.io -n longhorn-system \
+    -o jsonpath='{range .items[?(@.spec.allowScheduling==true)]}{.status.conditions[?(@.type=="Schedulable")].status}{"\n"}{end}' \
+    2>/dev/null | grep -c True)
+  [ "$ready" -ge 1 ] && { echo "  $ready schedulable storage node(s) with disks"; break; }
+  sleep 10
+done
+
+# ── 22i. Publish the storage watcher for the autoscaler box ───────────────────
 curl -sf "$REPO_URL/autoscaler/storage-watcher.py" -o $WEB_ROOT/autoscaler/storage-watcher.py
 chown www-data:www-data $WEB_ROOT/autoscaler/storage-watcher.py
 
