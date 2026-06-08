@@ -537,12 +537,14 @@ sudo systemctl is-active --quiet apache2 || {
     sudo journalctl -u apache2 --no-pager -n 50
     exit 1
 }
-echo "==> Apache CGI support configured"
-# ── 22. Storage tier: install Longhorn, grant SCCs, shape the tiers ───────────
+# ── 22. Storage tier: install Longhorn on OpenShift ───────────────────────────
+# Ordering matters — each gate unblocks the next:
+#   SCC → manager runs → finalizers RBAC → instance-managers create →
+#   they report MountPropagation → driver-deployer passes → CSI deploys → PVC binds
 echo "==> Setting up storage tier"
 LONGHORN_VERSION="v1.7.2"
 HELM_VERSION="v3.16.3"
-STORAGE_IPS="${STORAGE_IPS:-}"          # guard against set -u if Terraform didn't pass it
+STORAGE_IPS="${STORAGE_IPS:-}"          # guard against set -u
 
 # ── 22a. Label + taint the initial storage nodes ─────────────────────────────
 for ip in $STORAGE_IPS; do
@@ -569,10 +571,10 @@ helm upgrade --install longhorn longhorn/longhorn \
   --set defaultSettings.storageOverProvisioningPercentage=100 \
   --set defaultSettings.taintToleration="storage=longhorn:NoSchedule"
 
-# ── 22d. OpenShift SCCs — THE critical step the upstream docs omit ────────────
-# Every privileged Longhorn component (manager, instance-manager, CSI driver/
-# sidecars) is rejected by restricted-v2 until its ServiceAccount has 'privileged'.
-# The chart creates SAs lazily, so wait for them, then grant to ALL of them.
+# ── 22d. GATE 1: privileged SCC for every Longhorn SA ─────────────────────────
+# Manager, instance-manager, and CSI components are all privileged + hostPath, so
+# restricted-v2 rejects them until their ServiceAccount has 'privileged'. SAs are
+# created lazily by the chart, so wait, then grant to ALL of them.
 echo "  waiting for Longhorn service accounts..."
 for i in $(seq 1 30); do
   [ "$(oc get sa -n longhorn-system --no-headers 2>/dev/null | wc -l)" -gt 3 ] && break
@@ -581,12 +583,41 @@ done
 for sa in $(oc get sa -n longhorn-system -o jsonpath='{.items[*].metadata.name}'); do
   oc adm policy add-scc-to-user privileged -z "$sa" -n longhorn-system
 done
-# UI is nginx — it needs anyuid (write to /var/log/nginx, /var/lib/nginx), not privileged
+# UI is nginx — needs anyuid (write /var/log/nginx, /var/lib/nginx), not privileged
 oc adm policy add-scc-to-user anyuid -z longhorn-ui-service-account -n longhorn-system
 
-# ── 22e. Force the taint-toleration onto the manager DaemonSet ────────────────
+# ── 22e. GATE 2: finalizers RBAC — the fix the upstream docs DON'T have ────────
+# OpenShift enforces blockOwnerDeletion/ownerReference rules more strictly than
+# vanilla k8s. The chart's ClusterRole lacks 'update' on the /finalizers
+# subresources, so the manager CANNOT create instance-manager CRs (it sets an
+# ownerRef back to the Longhorn Node). Without this, instance-managers never
+# appear, no engine processes run, CSI never deploys, PVCs hang forever.
+oc apply -f - <<'RBAC'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: longhorn-finalizers-fix}
+rules:
+- apiGroups: ["longhorn.io"]
+  resources:
+    - nodes/finalizers
+    - instancemanagers/finalizers
+    - volumes/finalizers
+    - engines/finalizers
+    - replicas/finalizers
+    - engineimages/finalizers
+  verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: longhorn-finalizers-fix}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: longhorn-finalizers-fix}
+subjects:
+- {kind: ServiceAccount, name: longhorn-service-account, namespace: longhorn-system}
+RBAC
+
+# ── 22f. GATE 3: toleration onto the manager DaemonSet ────────────────────────
 # --set defaultSettings.taintToleration does NOT reach the manager DS pod spec at
-# install time (chicken-and-egg: the manager applies the setting but can't bootstrap
+# install (chicken-and-egg: the manager applies the setting but can't bootstrap
 # onto a tainted node first). Patch it directly so the manager lands on .40-.42.
 oc patch ds longhorn-manager -n longhorn-system --type=merge -p '{
   "spec":{"template":{"spec":{"tolerations":[
@@ -595,20 +626,44 @@ oc patch ds longhorn-manager -n longhorn-system --type=merge -p '{
 oc patch setting taint-toleration -n longhorn-system \
   --type=merge -p '{"value":"storage=longhorn:NoSchedule"}' 2>/dev/null || true
 
-# Restart so every component recreates under the granted SCC + toleration
+# Restart so the manager recreates under the granted SCC + RBAC + toleration.
+# This is what finally lets it create instance-managers on every node.
 oc rollout restart ds/longhorn-manager -n longhorn-system
 
-# ── 22f. Wait for the StorageClass (bounded) + make it default ────────────────
-for i in $(seq 1 60); do
-  oc get storageclass longhorn >/dev/null 2>&1 && break
-  echo "  waiting for longhorn StorageClass ($i/60)..."; sleep 10
+# ── 22g. GATE 4: wait for instance-managers on ALL Longhorn nodes ─────────────
+# The driver-deployer checks EVERY node for MountPropagation support, which a node
+# only reports once it has a running instance-manager. Must wait for all of them
+# before the deployer can succeed.
+echo "  waiting for instance-managers on all Longhorn nodes..."
+for i in $(seq 1 36); do
+  expected=$(oc get nodes.longhorn.io -n longhorn-system --no-headers 2>/dev/null | wc -l)
+  running=$(oc get pods -n longhorn-system --no-headers 2>/dev/null \
+            | grep '^instance-manager' | grep -c ' Running')
+  if [ "$expected" -gt 0 ] && [ "$running" -ge "$expected" ]; then
+    echo "  instance-managers up: $running/$expected"; break
+  fi
+  echo "  instance-managers $running/$expected ($i/36)..."; sleep 10
 done
+
+# ── 22h. GATE 5: restart the driver-deployer ──────────────────────────────────
+# If it ran before instance-managers reported MountPropagation it's stuck in
+# CrashLoopBackOff and won't re-check on its own. Kick it now that all nodes
+# report support — this time it passes and deploys the CSI stack.
+oc rollout restart deploy/longhorn-driver-deployer -n longhorn-system 2>/dev/null || true
+
+echo "  waiting for CSI provisioner..."
+for i in $(seq 1 30); do
+  oc get pods -n longhorn-system --no-headers 2>/dev/null \
+    | grep '^csi-provisioner' | grep -q ' Running' && { echo "  CSI up"; break; }
+  sleep 10
+done
+
+# ── 22i. StorageClass default + tier shaping ──────────────────────────────────
+for i in $(seq 1 60); do oc get storageclass longhorn >/dev/null 2>&1 && break; sleep 10; done
 oc patch storageclass longhorn -p \
   '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
-# ── 22g. Shape the tiers: workers attach volumes but never host replicas ──────
-# Storage nodes (.40+) keep allowScheduling=true (set by create-default-disk).
-# Disable scheduling on the compute workers so replicas only ever land on storage.
+# Workers attach volumes but never host replicas — disable their scheduling
 for ip in $WORKER_IPS; do
   node="ip-$(echo $ip | tr '.' '-')"
   for i in $(seq 1 30); do
@@ -618,17 +673,26 @@ for ip in $WORKER_IPS; do
     --type=merge -p '{"spec":{"allowScheduling":false}}' 2>/dev/null || true
 done
 
-# ── 22h. Verify storage disks come online before declaring success ────────────
-echo "  waiting for storage disks to register..."
+# ── 22j. Self-verify: a PVC must actually BIND before we call it done ─────────
+# Catches a silently-broken provisioning path instead of declaring false success.
+echo "  smoke-testing provisioning..."
+oc apply -f - <<'PVC'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: lh-smoke, namespace: default}
+spec: {accessModes: [ReadWriteOnce], storageClassName: longhorn, resources: {requests: {storage: 1Gi}}}
+PVC
+bound=false
 for i in $(seq 1 30); do
-  ready=$(oc get nodes.longhorn.io -n longhorn-system \
-    -o jsonpath='{range .items[?(@.spec.allowScheduling==true)]}{.status.conditions[?(@.type=="Schedulable")].status}{"\n"}{end}' \
-    2>/dev/null | grep -c True)
-  [ "$ready" -ge 1 ] && { echo "  $ready schedulable storage node(s) with disks"; break; }
+  [ "$(oc get pvc lh-smoke -n default -o jsonpath='{.status.phase}' 2>/dev/null)" = "Bound" ] \
+    && { bound=true; break; }
   sleep 10
 done
+oc delete pvc lh-smoke -n default --wait=false 2>/dev/null || true
+if $bound; then echo "==> storage provisioning VERIFIED"
+else echo "!! WARNING: smoke PVC never bound — check CSI / driver-deployer"; fi
 
-# ── 22i. Publish the storage watcher for the autoscaler box ───────────────────
+# ── 22k. Publish the storage watcher for the autoscaler box ───────────────────
 curl -sf "$REPO_URL/autoscaler/storage-watcher.py" -o $WEB_ROOT/autoscaler/storage-watcher.py
 chown www-data:www-data $WEB_ROOT/autoscaler/storage-watcher.py
 
