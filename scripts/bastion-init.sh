@@ -636,13 +636,13 @@ oc rollout restart ds/longhorn-manager -n longhorn-system
 # before the deployer can succeed.
 echo "  waiting for instance-managers on all Longhorn nodes..."
 for i in $(seq 1 36); do
-  expected=$(oc get nodes.longhorn.io -n longhorn-system --no-headers 2>/dev/null | wc -l)
-  running=$(oc get pods -n longhorn-system --no-headers 2>/dev/null \
+  expected=$(timeout 15 oc get nodes.longhorn.io -n longhorn-system --no-headers --request-timeout=10s 2>/dev/null | wc -l)
+  running=$(timeout 15 oc get pods -n longhorn-system --no-headers --request-timeout=10s 2>/dev/null \
             | grep '^instance-manager' | grep -c ' Running')
-  if [ "$expected" -gt 0 ] && [ "$running" -ge "$expected" ]; then
+  if [ "${expected:-0}" -gt 0 ] && [ "${running:-0}" -ge "${expected:-0}" ]; then
     echo "  instance-managers up: $running/$expected"; break
   fi
-  echo "  instance-managers $running/$expected ($i/36)..."; sleep 10
+  echo "  instance-managers ${running:-0}/${expected:-0} ($i/36)..."; sleep 10
 done
 
 # ── 22h. GATE 5: restart the driver-deployer ──────────────────────────────────
